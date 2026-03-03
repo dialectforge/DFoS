@@ -16,6 +16,10 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include "debug.h"
+#ifdef CONFIG_DIALECTFORGE
+#include <linux/dialectforge.h>
+#include <linux/scatterlist.h>
+#endif
 #include "direct.h"
 
 #define CREATE_TRACE_POINTS
@@ -160,6 +164,10 @@ dma_addr_t dma_map_page_attrs(struct device *dev, struct page *page,
 	dma_addr_t addr;
 
 	BUG_ON(!valid_dma_direction(dir));
+#ifdef CONFIG_DIALECTFORGE
+	if (df_mem_dma_check(page, dir, dev))
+		return DMA_MAPPING_ERROR;
+#endif
 
 	if (WARN_ON_ONCE(!dev->dma_mask))
 		return DMA_MAPPING_ERROR;
@@ -205,6 +213,16 @@ static int __dma_map_sg_attrs(struct device *dev, struct scatterlist *sg,
 	int ents;
 
 	BUG_ON(!valid_dma_direction(dir));
+#ifdef CONFIG_DIALECTFORGE
+	{
+		struct scatterlist *__s;
+		int __i;
+		for_each_sg(sg, __s, nents, __i) {
+			if (df_mem_dma_check(sg_page(__s), dir, dev))
+				return -EACCES;
+		}
+	}
+#endif
 
 	if (WARN_ON_ONCE(!dev->dma_mask))
 		return 0;

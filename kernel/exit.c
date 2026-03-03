@@ -6,6 +6,9 @@
  */
 
 #include <linux/mm.h>
+#ifdef CONFIG_DIALECTFORGE
+#include <linux/dialectforge.h>
+#endif
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/mm.h>
@@ -923,6 +926,9 @@ void __noreturn do_exit(long code)
 	tsk->exit_code = code;
 	taskstats_exit(tsk, group_dead);
 
+#ifdef CONFIG_DIALECTFORGE
+	df_mem_exit_cleanup(current);
+#endif
 	exit_mm();
 
 	if (group_dead)

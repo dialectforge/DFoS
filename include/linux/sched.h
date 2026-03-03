@@ -1603,6 +1603,22 @@ struct task_struct {
 	 * New fields for task_struct should be added above here, so that
 	 * they are included in the randomized portion of task_struct.
 	 */
+	
+#ifdef CONFIG_DIALECTFORGE
+	/* DialectForge per-process dialect context (defined inline to
+	 * avoid circular include with dialectforge.h) */
+	struct {
+		u8		seed_bytes[32];	/* 256-bit seed material */
+		u8		tier;		/* 0=native, 1=adopted, 2=quarantine */
+		u32		generation;	/* Depth in seed tree */
+		u32		zone_id;	/* Quarantine zone (0=none) */
+		u64		seed_born_ns;	/* When seed was derived */
+		u8		flags;		/* DF_TASKF_* */
+		u32		mem_gen;	/* Phase 5: memory dialect generation */
+		u8		mem_flags;	/* Phase 5: DF_MEMF_* */
+		struct callback_head	reencode_work;	/* task_work for deferred re-encode */
+	} df_ctx;
+#endif
 	randomized_struct_fields_end
 
 	/* CPU-specific state of this task: */

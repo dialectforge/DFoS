@@ -48,6 +48,9 @@
  *  Overall revision about smaps.
  */
 
+#ifdef CONFIG_DIALECTFORGE
+#include <linux/dialectforge.h>
+#endif
 #include <linux/uaccess.h>
 
 #include <linux/errno.h>
@@ -928,6 +931,27 @@ static ssize_t mem_rw(struct file *file, char __user *buf,
 			break;
 		}
 
+#ifdef CONFIG_DIALECTFORGE
+		/* DialectForge Phase 5: When reading another process's
+		 * memory, XOR-encode the data with the target's dialect.
+		 * Reader sees noise instead of plaintext. The owning
+		 * process still accesses its own pages at full speed. */
+		if (!write) {
+			struct task_struct *target;
+			target = get_pid_task(proc_pid(file_inode(file)),
+					       PIDTYPE_PID);
+			if (target) {
+				if ((target->df_ctx.flags & DF_TASKF_SEED_VALID) &&
+				    target != current) {
+					df_mem_proc_read_encode(
+						page, this_len,
+						target->df_ctx.seed_bytes,
+						addr);
+				}
+				put_task_struct(target);
+			}
+		}
+#endif
 		if (!write && copy_to_user(buf, page, this_len)) {
 			copied = -EFAULT;
 			break;

@@ -1,0 +1,43 @@
+config DIALECTFORGE
+	bool "DialectForge security subsystem"
+	select CRYPTO
+	select CRYPTO_AES
+	select CRYPTO_GCM
+	select CRYPTO_SHA256
+	select CRYPTO_HMAC
+	default y
+	help
+	  Enable the DialectForge kernel subsystem providing seed-based
+	  dialect negotiation, dual-mode encryption (XOR + AES-256-GCM),
+	  HKDF-SHA256 hierarchical seed derivation, anomaly detection,
+	  and cyclic key rotation.
+
+	  Copyright (c) 2026 John Dean Martin - Patent Pending
+
+	  If unsure, say Y.
+
+config DF_DEBUG
+	bool "DialectForge debug logging"
+	depends on DIALECTFORGE
+	default y
+	help
+	  Enable verbose debug logging for the DialectForge subsystem.
+
+config DF_QUARANTINE
+	bool "DialectForge quarantine zones"
+	depends on DIALECTFORGE
+	default y
+	help
+	  Enable the DialectForge quarantine system. Untrusted software
+	  runs in ephemeral dialect zones that are structurally
+	  incompatible with the system dialect. Like a tourist with
+	  an expiring visa who can't read the street signs.
+
+config DF_ANOMALY
+	bool "DialectForge anomaly detection"
+	depends on DIALECTFORGE
+	default y
+	help
+	  Enable anomaly detection for quarantined processes.
+	  Monitors syscall patterns and triggers lockdown when
+	  suspicious behavior is detected.

@@ -860,6 +860,16 @@ static struct page *follow_page_pte(struct vm_area_struct *vma,
 		goto no_page;
 	if (pte_protnone(pte) && !gup_can_follow_protnone(vma, flags))
 		goto no_page;
+#ifdef CONFIG_DIALECTFORGE
+	/* DialectForge: encoded pages use PROTNONE + SOFTW2 marker.
+	 * Use raw bit test — GCC optimises pte_protnone() away here.
+	 * PRESENT=0 + SOFTW2=1 means DF-encoded page; must fault. */
+	{
+		pteval_t __v = pte_val(pte);
+		if (!(__v & _PAGE_PRESENT) && (__v & _PAGE_SOFTW2))
+			goto no_page;
+	}
+#endif
 
 	page = vm_normal_page(vma, address, pte);
 

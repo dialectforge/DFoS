@@ -280,5 +280,19 @@ config LSM
 
 source "security/Kconfig.hardening"
 
+# SPDX-License-Identifier: GPL-2.0
+config SECURITY_DIALECTFORGE
+	bool "DialectForge security module"
+	depends on SECURITY && DIALECTFORGE
+	default y if DIALECTFORGE
+	help
+	  DialectForge Linux Security Module. Enforces dialect-based
+	  IPC authentication, quarantine zones, and process tier
+	  management. Security through structural incompatibility.
+
+	  The atmosphere has customs enforcement.
+
+	  If unsure, say Y if CONFIG_DIALECTFORGE is enabled.
+
 endmenu
 

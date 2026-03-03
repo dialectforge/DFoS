@@ -78,6 +78,9 @@
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
 #include <linux/sched/sysctl.h>
+#ifdef CONFIG_DIALECTFORGE
+#include <linux/dialectforge.h>
+#endif
 
 #include <trace/events/kmem.h>
 
@@ -3420,6 +3423,18 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		folio_add_new_anon_rmap(new_folio, vma, vmf->address, RMAP_EXCLUSIVE);
 		folio_add_lru_vma(new_folio, vma);
 		BUG_ON(unshare && pte_write(entry));
+#ifdef CONFIG_DIALECTFORGE
+			/* Phase 5: COW with PTE-marking scheme.
+			 * The old page was decoded by our fault handler (now cleartext).
+			 * The new COW page inherits cleartext content.
+			 * Track it as decoded-active so context switch re-encodes it
+			 * and flips its PTE to PROTNONE+SOFTW1. */
+			if (df_mem_is_enabled() && folio_test_anon(new_folio) &&
+			    (current->df_ctx.flags & DF_TASKF_SEED_VALID))
+				df_mem_track_active_page(current->mm,
+							 &new_folio->page,
+							 vmf->address);
+#endif
 		set_pte_at(mm, vmf->address, vmf->pte, entry);
 		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
 		if (old_folio) {
@@ -4832,6 +4847,30 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 setpte:
 	if (vmf_orig_pte_uffd_wp(vmf))
 		entry = pte_mkuffd_wp(entry);
+#ifdef CONFIG_DIALECTFORGE
+	/* Phase 5: encode-at-alloc + PTE marking.
+	 * Encode the page data immediately so RAM never holds cleartext.
+	 * Mark the PTE as PROTNONE + SOFTW2 so the CPU faults when
+	 * the process first touches it. Our decode handler in
+	 * handle_pte_fault intercepts, decodes, and restores PRESENT. */
+	if (df_mem_is_enabled() && !pte_special(entry) &&
+	    (current->df_ctx.flags & DF_TASKF_SEED_VALID)) {
+		df_mem_encode_page(&folio->page, current, addr);
+		/* Flip PTE: clear PRESENT, set PROTNONE + SOFTW2.
+		 * Must use flip_protnone_guard to invert PFN bits --
+		 * x86 inverts the physical address in non-present PTEs
+		 * as anti-speculation defence.  Without this, pte_pfn()
+		 * returns garbage and vm_normal_page triggers BUG. */
+		{
+			pteval_t old_v = pte_val(entry);
+			pteval_t v = old_v;
+			v &= ~_PAGE_PRESENT;
+			v |= _PAGE_PROTNONE | _PAGE_SOFTW2;
+			v = flip_protnone_guard(old_v, v, PTE_PFN_MASK);
+			entry = __pte(v);
+		}
+	}
+#endif
 	set_ptes(vma->vm_mm, addr, vmf->pte, entry, nr_pages);
 
 	/* No need to invalidate - it was non-present before */
@@ -5768,6 +5807,17 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 	if (!pte_present(vmf->orig_pte))
 		return do_swap_page(vmf);
 
+#ifdef CONFIG_DIALECTFORGE
+	/* DialectForge Phase 5: PTE-marked encoded pages.
+	 * Encoded pages use PROTNONE + SOFTW2 (bit 10).  Intercept BEFORE
+	 * the NUMA check so our pages never reach do_numa_page().
+	 * Use raw bit test — GCC optimises pte_protnone() away here. */
+	{
+		pteval_t __v = pte_val(vmf->orig_pte);
+		if (!(__v & _PAGE_PRESENT) && (__v & _PAGE_SOFTW2))
+			return df_mem_pte_decode_fault(vmf);
+	}
+#endif
 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
 		return do_numa_page(vmf);
 
@@ -5777,6 +5827,7 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 		update_mmu_tlb(vmf->vma, vmf->address, vmf->pte);
 		goto unlock;
 	}
+
 	if (vmf->flags & (FAULT_FLAG_WRITE|FAULT_FLAG_UNSHARE)) {
 		if (!pte_write(entry))
 			return do_wp_page(vmf);

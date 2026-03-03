@@ -431,3 +431,4 @@ config IO_WQ
 	bool
 
 endmenu
+source "fs/dialectfs/Kconfig"

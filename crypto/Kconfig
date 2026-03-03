@@ -1471,6 +1471,19 @@ endif
 if X86
 source "arch/x86/crypto/Kconfig"
 endif
+
+config DF_KYBER
+	tristate "DialectForge Kyber-768 post-quantum KEM"
+	depends on DIALECTFORGE
+	select CRYPTO_SHA256
+	default y
+	help
+	  CRYSTALS-Kyber-768 post-quantum key encapsulation for
+	  DialectForge initial seed exchange. Ensures quantum computers
+	  cannot break the initial negotiation.
+
+	  Copyright (c) 2026 John Dean Martin - Patent Pending
+
 endif
 
 source "drivers/crypto/Kconfig"

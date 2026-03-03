@@ -1,0 +1,10 @@
+config DIALECTFS
+	tristate "DialectForge encrypted filesystem"
+	depends on DIALECTFORGE
+	help
+	  Native VFS filesystem providing transparent DialectForge
+	  encryption with sector hopping. Stacks over any existing
+	  filesystem. Pull the drive = noise.
+
+	  Can be built as module (M) or compiled into kernel (Y).
+	  If unsure, say Y.

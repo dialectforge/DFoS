@@ -29,3 +29,5 @@ obj-$(CONFIG_SECURITY_IPE)		+= ipe/
 
 # Object integrity file lists
 obj-$(CONFIG_INTEGRITY)			+= integrity/
+
+obj-$(CONFIG_SECURITY_DIALECTFORGE) += df_lsm.o df_quarantine.o

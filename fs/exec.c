@@ -77,6 +77,9 @@
 #include "internal.h"
 
 #include <trace/events/sched.h>
+#ifdef CONFIG_DIALECTFORGE
+#include <linux/dialectforge.h>
+#endif
 
 static int bprm_creds_from_file(struct linux_binprm *bprm);
 
@@ -807,6 +810,13 @@ int setup_arg_pages(struct linux_binprm *bprm,
 		 * the binfmt code determines where the new stack should reside, we shift it to
 		 * its final location.
 		 */
+#ifdef CONFIG_DIALECTFORGE
+		/* DialectForge: XOR encryption keys include the virtual address.
+		 * Decode all encoded pages BEFORE relocation so move_ptes()
+		 * copies cleartext PRESENT PTEs. Pages will be re-encoded
+		 * on next context switch with their correct new addresses. */
+		df_mem_decode_vma_range(mm, vma->vm_start, vma->vm_end);
+#endif
 		ret = relocate_vma_down(vma, stack_shift);
 		if (ret)
 			goto out_unlock;
@@ -1286,6 +1296,15 @@ int begin_new_exec(struct linux_binprm * bprm)
 		goto out;
 
 	bprm->mm = NULL;
+
+#ifdef CONFIG_DIALECTFORGE
+	/* Clear stale DF memory tracking from the old mm.
+	 * SLUB reuses mm_struct addresses, so the new mm likely hashes
+	 * to the same active[] bucket as the old mm.  Without this,
+	 * reencode_work processes stale entries — XOR-encoding freed
+	 * pages and flipping PTEs at wrong addresses in the new mm. */
+	df_mem_exec_reset();
+#endif
 
 	retval = exec_task_namespaces();
 	if (retval)

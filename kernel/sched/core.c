@@ -8,6 +8,9 @@
  *  Copyright (C) 1998-2024  Ingo Molnar, Red Hat
  */
 #include <linux/highmem.h>
+#ifdef CONFIG_DIALECTFORGE
+#include <linux/dialectforge.h>
+#endif
 #include <linux/hrtimer_api.h>
 #include <linux/ktime_api.h>
 #include <linux/sched/signal.h>
@@ -5200,6 +5203,13 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	tick_nohz_task_switch();
 	finish_lock_switch(rq);
 	finish_arch_post_lock_switch();
+
+#ifdef CONFIG_DIALECTFORGE
+	/* Re-encode decoded pages of the prev task.  Done here (after
+	 * finish_lock_switch drops rq->lock and re-enables IRQs) so the
+	 * expensive HMAC-SHA256 crypto never runs under scheduler locks. */
+	df_mem_context_switch(prev, current);
+#endif
 	kcov_finish_switch(current);
 	/*
 	 * kmap_local_sched_out() is invoked with rq::lock held and
@@ -6569,6 +6579,12 @@ static void __sched notrace __schedule(int sched_mode)
 
 	if (sched_feat(HRTICK) || sched_feat(HRTICK_DL))
 		hrtick_clear(rq);
+
+#ifdef CONFIG_DIALECTFORGE
+	/* Fast PTE-protect + queue deferred XOR.  BEFORE irq_disable/rq_lock
+	 * so PTE walks can safely take page-table locks. */
+	df_mem_schedule_protect(prev);
+#endif
 
 	local_irq_disable();
 	rcu_note_context_switch(preempt);

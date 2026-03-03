@@ -4,6 +4,9 @@
  *
  *  Copyright (C) 1991, 1992  Linus Torvalds
  */
+#ifdef CONFIG_DIALECTFORGE
+#include <linux/dialectforge.h>
+#endif
 
 /*
  *  'fork.c' contains the help-routines for the 'fork' system call
@@ -639,10 +642,21 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 	unsigned long charge = 0;
 	LIST_HEAD(uf);
 	VMA_ITERATOR(vmi, mm, 0);
+#ifdef CONFIG_DIALECTFORGE
+	struct df_active_page *df_fork_snap = NULL;
+	unsigned int df_fork_snap_count = 0;
+#endif
 
 	if (mmap_write_lock_killable(oldmm))
 		return -EINTR;
 	flush_cache_dup_mm(oldmm);
+#ifdef CONFIG_DIALECTFORGE
+	/* Clear parent's active[] before copying PTEs.
+	 * Prevents CoW corruption: empty active[] means schedule_protect
+	 * has nothing to flip if preempted during copy_page_range.
+	 * Snapshot is restored by df_mem_post_fork_parent() below. */
+	df_fork_snap = df_mem_pre_fork(oldmm, &df_fork_snap_count);
+#endif
 	uprobe_dup_mmap(oldmm, mm);
 	/*
 	 * Not linked in yet - no deadlock potential:
@@ -775,6 +789,12 @@ loop_out:
 out:
 	mmap_write_unlock(mm);
 	flush_tlb_mm(oldmm);
+#ifdef CONFIG_DIALECTFORGE
+	/* Restore parent's active[] now that CoW is properly set up.
+	 * The reencode_work CoW guard (folio_mapcount > 1) will skip
+	 * any pages shared with the child. */
+	df_mem_post_fork_parent(oldmm, df_fork_snap, df_fork_snap_count);
+#endif
 	mmap_write_unlock(oldmm);
 	if (!retval)
 		dup_userfaultfd_complete(&uf);
@@ -2393,6 +2413,9 @@ __latent_entropy struct task_struct *copy_process(
 	retval = copy_mm(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_signal;
+	#ifdef CONFIG_DIALECTFORGE
+	df_mem_fork_init(p, current);
+#endif
 	retval = copy_namespaces(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_mm;

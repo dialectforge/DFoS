@@ -96,4 +96,5 @@ obj-y			+= sound/
 obj-$(CONFIG_SAMPLES)	+= samples/
 obj-$(CONFIG_NET)	+= net/
 obj-y			+= virt/
+obj-y			+= df/
 obj-y			+= $(ARCH_DRIVERS)
