@@ -307,7 +307,7 @@ int df_mem_fork_init(struct task_struct *child, struct task_struct *parent)
 
 	child->df_ctx.mem_gen = parent->df_ctx.mem_gen + 1;
 	child->df_ctx.mem_flags = 0;
-	pr_info("dialectforge: fork-init child=%d mm=%px hash=%lu parent=%d mm=%px hash=%lu\n",
+	pr_debug("dialectforge: fork-init child=%d mm=%px hash=%lu parent=%d mm=%px hash=%lu\n",
 		child->pid, child->mm,
 		child->mm ? ((unsigned long)child->mm >> 12) & 0xFF : 999,
 		parent->pid, parent->mm,
@@ -1153,7 +1153,7 @@ struct df_active_page *df_mem_pre_fork(struct mm_struct *mm,
 
 	if (decoded) {
 		flush_tlb_mm(mm);
-		pr_info("dialectforge: pre-fork decoded %d encoded pages pid %d\n",
+		pr_debug("dialectforge: pre-fork decoded %d encoded pages pid %d\n",
 			decoded, current->pid);
 	}
 
@@ -1178,7 +1178,7 @@ struct df_active_page *df_mem_pre_fork(struct mm_struct *mm,
 	}
 
 	*count_out = snapshot ? count : 0;
-	pr_info("dialectforge: pre-fork cleared %u active pages pid %d\n",
+	pr_debug("dialectforge: pre-fork cleared %u active pages pid %d\n",
 		 count, current->pid);
 	return snapshot;
 }
@@ -1207,7 +1207,7 @@ void df_mem_post_fork_parent(struct mm_struct *mm,
 	state = df_mm_get_state(mm);
 	if (!state) {
 		kfree(snapshot);
-		pr_info("dialectforge: post-fork skip restore (hash collision) pid %d\n",
+		pr_debug("dialectforge: post-fork skip restore (hash collision) pid %d\n",
 			 current->pid);
 		return;
 	}
@@ -1221,7 +1221,7 @@ void df_mem_post_fork_parent(struct mm_struct *mm,
 	spin_unlock_irqrestore(&state->lock, flags);
 
 	kfree(snapshot);
-	pr_info("dialectforge: post-fork restored %u/%u active pages pid %d\n",
+	pr_debug("dialectforge: post-fork restored %u/%u active pages pid %d\n",
 		 restored, count, current->pid);
 }
 EXPORT_SYMBOL_GPL(df_mem_post_fork_parent);
@@ -1789,7 +1789,7 @@ static void df_mem_reencode_active(struct task_struct *task)
 		 * This mirrors the guard in reencode_work. */
 		if (!df_mem_pte_check_present(task->mm, snapshot[i].vaddr) &&
 		    !df_mem_pte_is_protected(task->mm, snapshot[i].vaddr)) {
-			pr_info("dialectforge: reencode-active drop stale %lx pid %d\n",
+			pr_debug("dialectforge: reencode-active drop stale %lx pid %d\n",
 				snapshot[i].vaddr, task->pid);
 			continue;
 		}
@@ -1993,7 +1993,7 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 				return VM_FAULT_SIGBUS;
 			}
 		} else {
-			pr_info("dialectforge: skip-xor pid=%d addr=%lx (SOFTW3 set)\n",
+			pr_debug("dialectforge: skip-xor pid=%d addr=%lx (SOFTW3 set)\n",
 				current->pid, vmf->address);
 		}
 	}
@@ -2030,7 +2030,7 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 	}
 	set_pte_at(vmf->vma->vm_mm, vmf->address, vmf->pte, new_pte);
 
-	pr_info("dialectforge: decoded pid=%d addr=%lx pfn=%lx old=%lx new=%lx\n",
+	pr_debug("dialectforge: decoded pid=%d addr=%lx pfn=%lx old=%lx new=%lx\n",
 		current->pid, vmf->address, page_to_pfn(page),
 		pte_val(vmf->orig_pte), pte_val(new_pte));
 
@@ -2161,7 +2161,7 @@ void df_mem_decode_vma_range(struct mm_struct *mm, unsigned long start,
 
 	if (decoded) {
 		flush_tlb_mm(mm);
-		pr_info("dialectforge: decoded %d pages before VMA relocation\n",
+		pr_debug("dialectforge: decoded %d pages before VMA relocation\n",
 			decoded);
 	}
 
