@@ -1,0 +1,25 @@
+# Build artifacts
+*.o
+*.a
+*.ko
+*.cmd
+*.mod
+*.mod.c
+*.order
+*.symvers
+modules.builtin
+
+# Backup files
+*.bak
+*.traced
+*.orig
+*.tmp
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
