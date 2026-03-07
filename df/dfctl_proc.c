@@ -139,7 +139,7 @@ int df_dfctl_proc_init(void)
 {
     struct proc_dir_entry *entry;
 
-    entry = proc_create("dfctl", 0644, NULL, &dfctl_proc_ops);
+    entry = proc_create("dfctl", 0400, NULL, &dfctl_proc_ops);
     if (!entry)
         return -ENOMEM;
 

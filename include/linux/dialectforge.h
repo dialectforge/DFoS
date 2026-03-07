@@ -300,6 +300,7 @@ struct df_task_context {
 #define DF_TASKF_SEED_VALID     0x01    /* Seed has been initialized      */
 #define DF_TASKF_QUARANTINED    0x02    /* In quarantine zone             */
 #define DF_TASKF_PROMOTED       0x04    /* Was quarantine, now adopted    */
+#define DF_TASKF_CLEARTEXT      0x08    /* Translator mode: skip XOR      */
 
 /* Quarantine configuration */
 #define DF_QUARANTINE_TTL_DEFAULT_MS   300000  /* 5 minutes default TTL  */

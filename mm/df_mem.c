@@ -211,7 +211,8 @@ struct df_mem_pcpu {
 static DEFINE_PER_CPU(struct df_mem_pcpu, df_mem_pcpu_data);
 
 static bool df_mem_initialized = false;
-static bool df_mem_enabled = true;  /* can be deferred via df.mem_defer=1 */
+static bool df_mem_enabled = true;  /* boot-time only: df.mem_off=1 to disable */
+static bool df_mem_defer_requested = false;  /* set by df.mem_defer=1 */
 
 static atomic64_t df_dma_blocked_count = ATOMIC64_INIT(0);
 static atomic64_t df_dma_flagged_count = ATOMIC64_INIT(0);
@@ -524,11 +525,34 @@ static int __init df_mem_defer_setup(char *str)
 {
 	if (str && *str == '1') {
 		df_mem_enabled = false;
+		df_mem_defer_requested = true;
 		pr_info("DialectForge: Memory protection deferred (df.mem_defer=1)\n");
 	}
 	return 1;
 }
 __setup("df.mem_defer=", df_mem_defer_setup);
+
+static int __init df_mem_off_setup(char *str)
+{
+	if (str && *str == '1') {
+		df_mem_enabled = false;
+		df_mem_defer_requested = false;  /* prevent auto-re-enable */
+		pr_info("DialectForge: Memory protection DISABLED by boot param (df.mem_off=1)\n");
+	}
+	return 1;
+}
+__setup("df.mem_off=", df_mem_off_setup);
+
+static int __init df_mem_safemode_setup(char *str)
+{
+	if (str && *str == '1') {
+		df_mem_enabled = false;
+		df_mem_defer_requested = false;  /* prevent auto-re-enable */
+		pr_info("DialectForge: SAFE MODE - memory protection disabled, network disabled\n");
+	}
+	return 1;
+}
+__setup("df.safemode=", df_mem_safemode_setup);
 
 /* ---- Seed-on-enable: derive seeds for all deferred processes ---- */
 #define DF_MAX_DEFERRED_PIDS 4096
@@ -609,34 +633,11 @@ static int df_mem_seed_all_processes(void)
 	return 0;
 }
 
-static ssize_t df_mem_enable_write(struct file *file,
-				   const char __user *buf,
-				   size_t count, loff_t *ppos)
-{
-	char c;
-	/* Only CAP_SYS_ADMIN may toggle memory protection */
-	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
-	pr_debug("dialectforge: enable_write called count=%zu enabled=%d\n", count, df_mem_enabled);
-	if (count < 1)
-		return -EINVAL;
-	if (get_user(c, buf))
-		return -EFAULT;
-	if (c == '1' && !df_mem_enabled) {
-		/* Seed all processes BEFORE enabling protection.
-		 * This closes the race window -- any fork during
-		 * seeding inherits from an already-seeded parent
-		 * via the on-demand path in fork_init. */
-		df_mem_seed_all_processes();
-		smp_wmb();
-		df_mem_enabled = true;
-		pr_debug("dialectforge: memory protection enabled\n");
-	} else if (c == '0') {
-		df_mem_enabled = false;
-		pr_debug("dialectforge: memory protection disabled\n");
-	}
-	return count;
-}
+/* Runtime toggle REMOVED — protection state is boot-time only.
+ * Controlled exclusively via GRUB kernel parameters:
+ *   df.mem_off=1   — disable protection (requires GRUB superuser)
+ *   df.safemode=1  — safe mode, no protection (requires GRUB superuser)
+ * /proc/df_mem_enable is now a read-only status indicator. */
 
 static int df_mem_enable_show(struct seq_file *m, void *v)
 {
@@ -652,7 +653,6 @@ static int df_mem_enable_open(struct inode *inode, struct file *file)
 static const struct proc_ops df_mem_enable_proc_ops = {
 	.proc_open    = df_mem_enable_open,
 	.proc_read    = seq_read,
-	.proc_write   = df_mem_enable_write,
 	.proc_lseek   = seq_lseek,
 	.proc_release = single_release,
 };
@@ -688,13 +688,19 @@ static int __init df_mem_init(void)
 
 	if (!proc_create("df_mem", 0444, NULL, &df_mem_proc_ops))
 		pr_warn("df_mem: /proc/df_mem creation failed\n");
-	if (!proc_create("df_mem_enable", 0600, NULL, &df_mem_enable_proc_ops))
+	if (!proc_create("df_mem_enable", 0444, NULL, &df_mem_enable_proc_ops))
 		pr_warn("df_mem: /proc/df_mem_enable creation failed\n");
 
 	df_mem_mm_states_init();
 	df_mem_initialized = true;
 
 	pr_info("DialectForge: Memory Protection ACTIVE\n");
+
+	/* Harden sysctl defaults for DFoS */
+	{
+		extern int kptr_restrict;
+		kptr_restrict = 2;  /* hide kernel pointers even from root */
+	}
 	pr_info("  Backend:      %s\n",
 		df_mem_backend_names[df_mem_active_backend]);
 	pr_info("  Context wipe: max (TLB + cache flush)\n");
@@ -704,6 +710,37 @@ static int __init df_mem_init(void)
 }
 
 late_initcall(df_mem_init);
+
+/* ---- Deferred auto-activation -----------------------------------
+ * When df.mem_defer=1, protection starts disabled so early-boot
+ * processes can run unseeded.  This late_initcall_sync seeds every
+ * existing process and flips protection on — no userspace write
+ * to /proc needed.  Runs after all late_initcalls complete.
+ */
+static int __init df_mem_deferred_activate(void)
+{
+	if (df_mem_enabled) {
+		/* Already enabled (no deferral requested) */
+		return 0;
+	}
+	/* If explicitly disabled by df.mem_off=1 or df.safemode=1,
+	 * do NOT auto-enable. Check: if init set enabled=false AND
+	 * defer was also requested, we should activate.  But if
+	 * mem_off was used, enabled is false and we should stay off.
+	 * Distinguish via a separate flag. */
+	if (!df_mem_defer_requested) {
+		pr_info("DialectForge: protection permanently off (boot param)\n");
+		return 0;
+	}
+	pr_info("dialectforge: deferred activation — seeding all processes\n");
+	df_mem_seed_all_processes();
+	smp_wmb();
+	df_mem_enabled = true;
+	pr_info("DialectForge: Memory protection ENABLED (deferred)\n");
+	return 0;
+}
+late_initcall_sync(df_mem_deferred_activate);
+
 
 
 /* ============================================================

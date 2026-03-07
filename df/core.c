@@ -174,7 +174,7 @@ static struct proc_dir_entry *df_proc_entry;
 
 static int df_proc_init(void)
 {
-	df_proc_entry = proc_create("dialectforge", 0444, NULL, &df_proc_ops);
+	df_proc_entry = proc_create("dialectforge", 0400, NULL, &df_proc_ops);
 	if (!df_proc_entry) return -ENOMEM;
 	pr_info("dialectforge: /proc/dialectforge active\n");
 
