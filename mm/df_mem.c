@@ -275,12 +275,14 @@ int df_mem_fork_init(struct task_struct *child, struct task_struct *parent)
 	 * between df_mem_enabled=true and seed_all_processes. */
 	if (!(parent->df_ctx.flags & DF_TASKF_SEED_VALID)) {
 		struct df_seed on_demand;
-		char label[32];
-		int ret;
+		u8 label[48];  /* 16 random + "pid:NNNNN" */
+		int label_len, ret;
 
-		snprintf(label, sizeof(label), "pid:%d", parent->pid);
+		get_random_bytes(label, 16);
+		label_len = 16 + snprintf((char *)label + 16, 32,
+					  "pid:%d", parent->pid);
 		ret = df_seed_derive_labeled(df_get_system_root_seed(),
-					     label, strlen(label),
+					     (char *)label, label_len,
 					     &on_demand);
 		if (ret) {
 			pr_warn("dialectforge: fork-init seed derivation failed pid %d: %d\n",
@@ -537,7 +539,8 @@ static int df_mem_seed_all_processes(void)
 	int count = 0, i, seeded = 0, ret;
 	struct task_struct *p;
 	struct df_seed child_seed;
-	char label[32];
+	u8 label[48];  /* 16 random + "pid:NNNNN" */
+	int label_len;
 
 	pids = kmalloc_array(DF_MAX_DEFERRED_PIDS, sizeof(pid_t), GFP_KERNEL);
 	if (!pids)
@@ -571,9 +574,11 @@ static int df_mem_seed_all_processes(void)
 
 		/* Always re-seed: inherited SEED_VALID is stale */
 
-		snprintf(label, sizeof(label), "pid:%d", pids[i]);
+		get_random_bytes(label, 16);
+		label_len = 16 + snprintf((char *)label + 16, 32,
+					  "pid:%d", pids[i]);
 		ret = df_seed_derive_labeled(df_get_system_root_seed(),
-					     label, strlen(label),
+					     (char *)label, label_len,
 					     &child_seed);
 		if (ret) {
 			pr_warn("dialectforge: seed derivation failed pid %d: %d\n",
@@ -609,6 +614,9 @@ static ssize_t df_mem_enable_write(struct file *file,
 				   size_t count, loff_t *ppos)
 {
 	char c;
+	/* Only CAP_SYS_ADMIN may toggle memory protection */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 	pr_debug("dialectforge: enable_write called count=%zu enabled=%d\n", count, df_mem_enabled);
 	if (count < 1)
 		return -EINVAL;
@@ -680,7 +688,7 @@ static int __init df_mem_init(void)
 
 	if (!proc_create("df_mem", 0444, NULL, &df_mem_proc_ops))
 		pr_warn("df_mem: /proc/df_mem creation failed\n");
-	if (!proc_create("df_mem_enable", 0644, NULL, &df_mem_enable_proc_ops))
+	if (!proc_create("df_mem_enable", 0600, NULL, &df_mem_enable_proc_ops))
 		pr_warn("df_mem: /proc/df_mem_enable creation failed\n");
 
 	df_mem_mm_states_init();
@@ -734,6 +742,9 @@ struct df_mem_mm_state {
 	unsigned int count;
 	struct df_mem_nonce_entry encode_nonces[DF_MEM_MAX_NONCES];
 	unsigned int nonce_count;
+	/* Fault rate limiting: kill process if > threshold faults/sec */
+	unsigned int fault_count;
+	unsigned long fault_window_start;  /* jiffies */
 	spinlock_t lock;
 };
 
@@ -1920,6 +1931,30 @@ int df_mem_decode_fault(struct vm_fault *vmf)
 
 	if (!(current->df_ctx.mem_flags & DF_MEMF_PAGES_ENCODED))
 		return -1;
+
+	/* Rate limit: kill process doing > 10000 decode faults per second */
+	{
+		struct df_mem_mm_state *rl = df_mm_get_state(current->mm);
+		if (rl) {
+			unsigned long now = jiffies;
+			spin_lock(&rl->lock);
+			if (time_after(now, rl->fault_window_start + HZ)) {
+				rl->fault_count = 1;
+				rl->fault_window_start = now;
+			} else {
+				rl->fault_count++;
+				if (rl->fault_count > 10000) {
+					spin_unlock(&rl->lock);
+					pr_warn_ratelimited(
+						"dialectforge: pid %d exceeded fault rate limit, killing\n",
+						current->pid);
+					force_sig(SIGKILL);
+					return -1;
+				}
+			}
+			spin_unlock(&rl->lock);
+		}
+	}
 
 	/* Get the page from the PTE */
 	if (!vmf->pte)
