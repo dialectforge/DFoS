@@ -27,6 +27,7 @@
 #include <linux/random.h>
 #include <linux/crypto.h>
 #include <crypto/hash.h>
+#include <crypto/internal/cipher.h>
 #include <linux/scatterlist.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -200,14 +201,11 @@ struct df_mem_pcpu {
 	u8 decode_buf[PAGE_SIZE];
 	bool active;
 	spinlock_t lock;
-	/* Pre-allocated HMAC-SHA256 transform + desc (avoids sleeping
-	 * in page-fault context where crypto_alloc_shash is forbidden) */
-	struct crypto_shash *sw_tfm;
-	struct shash_desc *sw_desc;
-	/* Pre-allocated work buffers for keystream generation —
-	 * keeps 76+ bytes off the kernel stack in the page-fault path */
-	u8 counter_block[48]; /* seed(32) + addr(8) + ctr(4) + nonce(4) */
-	u8 hash_out[32];
+	/* Pre-allocated AES-256-CTR cipher (uses AES-NI when available,
+	 * avoids sleeping in page-fault context) */
+	struct crypto_cipher *aes_tfm;
+	/* Pre-allocated work buffer for CTR counter block (16 bytes = AES block) */
+	u8 ctr_block[16]; /* 4 counter + 4 nonce + 8 addr */
 };
 
 static DEFINE_PER_CPU(struct df_mem_pcpu, df_mem_pcpu_data);
@@ -545,12 +543,13 @@ static int df_mem_seed_all_processes(void)
 	if (!pids)
 		return -ENOMEM;
 
-	/* Phase 1: Collect seedless PIDs under RCU */
+	/* Phase 1: Collect ALL userspace PIDs under RCU.
+	 * We do NOT skip DF_TASKF_SEED_VALID because during deferred boot,
+	 * dup_task_struct copies the parent's flags including SEED_VALID.
+	 * All processes share init's seed — each needs a unique one. */
 	rcu_read_lock();
 	for_each_process(p) {
-		if (!p->mm)
-			continue;
-		if (p->df_ctx.flags & DF_TASKF_SEED_VALID)
+		if (!p->mm)				/* skip kernel threads */
 			continue;
 		if (count < DF_MAX_DEFERRED_PIDS)
 			pids[count++] = p->pid;
@@ -570,10 +569,7 @@ static int df_mem_seed_all_processes(void)
 		get_task_struct(p);
 		rcu_read_unlock();
 
-		if (p->df_ctx.flags & DF_TASKF_SEED_VALID) {
-			put_task_struct(p);
-			continue;
-		}
+		/* Always re-seed: inherited SEED_VALID is stale */
 
 		snprintf(label, sizeof(label), "pid:%d", pids[i]);
 		ret = df_seed_derive_labeled(df_get_system_root_seed(),
@@ -663,33 +659,23 @@ static int __init df_mem_init(void)
 
 	for_each_possible_cpu(cpu) {
 		struct df_mem_pcpu *pcpu = per_cpu_ptr(&df_mem_pcpu_data, cpu);
-		struct crypto_shash *tfm;
+		struct crypto_cipher *tfm;
 
 		spin_lock_init(&pcpu->lock);
 		memset(pcpu->keystream, 0, DF_MEM_KEYSTREAM_BYTES);
 		memset(pcpu->decode_buf, 0, PAGE_SIZE);
 		pcpu->active = false;
 
-		/* Pre-allocate HMAC-SHA256 transform per CPU so the
-		 * keystream generator never has to sleep. */
-		tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+		/* Pre-allocate AES-256 cipher per CPU.
+		 * With -cpu host, kernel auto-selects AES-NI. */
+		tfm = crypto_alloc_cipher("aes", 0, 0);
 		if (IS_ERR(tfm)) {
-			pr_err("df_mem: CPU%d: crypto_alloc_shash failed: %ld\n",
+			pr_err("df_mem: CPU%d: crypto_alloc_cipher(aes) failed: %ld\n",
 			       cpu, PTR_ERR(tfm));
-			pcpu->sw_tfm = NULL;
-			pcpu->sw_desc = NULL;
+			pcpu->aes_tfm = NULL;
 			continue;
 		}
-		pcpu->sw_tfm = tfm;
-		pcpu->sw_desc = kzalloc(sizeof(struct shash_desc) +
-					crypto_shash_descsize(tfm), GFP_KERNEL);
-		if (!pcpu->sw_desc) {
-			pr_err("df_mem: CPU%d: shash_desc alloc failed\n", cpu);
-			crypto_free_shash(tfm);
-			pcpu->sw_tfm = NULL;
-			continue;
-		}
-		pcpu->sw_desc->tfm = tfm;
+		pcpu->aes_tfm = tfm;
 	}
 
 	if (!proc_create("df_mem", 0444, NULL, &df_mem_proc_ops))
@@ -1639,58 +1625,46 @@ EXPORT_SYMBOL_GPL(df_mem_is_enabled);
 /* ============================================================
  * SECTION 3: Software Backend — Keystream Engine
  * ============================================================ */
-
 /* Caller MUST hold pcpu->lock and pass the pcpu pointer.
- * Uses pre-allocated per-CPU HMAC-SHA256 transform so we
- * never sleep (no crypto_alloc_shash in fault context). */
+ * Uses pre-allocated per-CPU AES-256 cipher in CTR mode.
+ * With AES-NI (-cpu host), this is hardware-accelerated.
+ * Counter block layout (16 bytes): [4 counter | 4 nonce | 8 addr] */
 static int df_sw_generate_keystream(struct df_mem_pcpu *pcpu,
 				    const u8 *seed_bytes,
 				    unsigned long page_addr, u32 nonce,
 				    u8 *out)
 {
-	struct shash_desc *desc;
-	u8 *counter_block = pcpu->counter_block;
-	u8 *hash_out = pcpu->hash_out;
+	u8 *ctr = pcpu->ctr_block;
 	unsigned int offset = 0;
 	u32 counter = 0;
 	int ret;
 
-	if (unlikely(!pcpu->sw_tfm || !pcpu->sw_desc))
+	if (unlikely(!pcpu->aes_tfm))
 		return -ENODEV;
 
-	desc = pcpu->sw_desc;
-	ret = crypto_shash_setkey(pcpu->sw_tfm, seed_bytes, 32);
+	/* Set the 256-bit key (seed) */
+	ret = crypto_cipher_setkey(pcpu->aes_tfm, seed_bytes, 32);
 	if (ret)
 		return ret;
 
-	memcpy(counter_block, seed_bytes, 32);
-	memcpy(counter_block + 32, &page_addr, sizeof(page_addr));
-	memcpy(counter_block + 44, &nonce, 4);
+	/* Build the static part of the counter block:
+	 * [0..3]  = counter (changes each iteration)
+	 * [4..7]  = nonce
+	 * [8..15] = page virtual address */
+	memset(ctr, 0, 16);
+	memcpy(ctr + 4, &nonce, 4);
+	memcpy(ctr + 8, &page_addr, sizeof(page_addr));
 
+	/* Generate PAGE_SIZE bytes of keystream: 256 x AES-ECB(key, ctr++) */
 	while (offset < PAGE_SIZE) {
-		unsigned int chunk = min_t(unsigned int, 32, PAGE_SIZE - offset);
-
-		memcpy(counter_block + 40, &counter, 4);
-
-		ret = crypto_shash_init(desc);
-		if (ret)
-			break;
-		ret = crypto_shash_update(desc, counter_block,
-					  48);  /* 32 seed + 8 addr + 4 counter + 4 nonce */
-		if (ret)
-			break;
-		ret = crypto_shash_final(desc, hash_out);
-		if (ret)
-			break;
-
-		memcpy(out + offset, hash_out, chunk);
-		offset += chunk;
+		memcpy(ctr, &counter, 4);
+		crypto_cipher_encrypt_one(pcpu->aes_tfm, out + offset, ctr);
+		offset += 16;  /* AES block = 16 bytes */
 		counter++;
 	}
 
-	memzero_explicit(hash_out, 32);
-	memzero_explicit(counter_block, 48);
-	return ret;
+	memzero_explicit(ctr, 16);
+	return 0;
 }
 
 static int df_sw_xor_page(struct page *page, const u8 *seed_bytes,
@@ -2039,9 +2013,9 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 	}
 
 	if (!current->mm) {
-		pr_info("dialectforge: SIGBUS no-mm pid=%d addr=%lx\n",
+		pr_debug("dialectforge: SIGBUS no-mm pid=%d addr=%lx\n",
 			current->pid, vmf->address);
-		return VM_FAULT_SIGBUS;
+		return 0;	/* let fault retry; process will be reaped */
 	}
 
 	if (!(current->df_ctx.flags & DF_TASKF_SEED_VALID)) {
