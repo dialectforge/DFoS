@@ -206,7 +206,7 @@ struct df_mem_pcpu {
 	struct shash_desc *sw_desc;
 	/* Pre-allocated work buffers for keystream generation —
 	 * keeps 76+ bytes off the kernel stack in the page-fault path */
-	u8 counter_block[44]; /* seed(32) + addr(8) + ctr(4) */
+	u8 counter_block[48]; /* seed(32) + addr(8) + ctr(4) + nonce(4) */
 	u8 hash_out[32];
 };
 
@@ -221,9 +221,9 @@ static atomic64_t df_dma_allowed_count = ATOMIC64_INIT(0);
 /* Forward declarations */
 static int df_sw_generate_keystream(struct df_mem_pcpu *pcpu,
                     const u8 *seed_bytes,
-                    unsigned long page_addr, u8 *out);
+                    unsigned long page_addr, u32 nonce, u8 *out);
 static int df_sw_xor_page(struct page *page, const u8 *seed_bytes,
-               unsigned long vaddr);
+               unsigned long vaddr, u32 nonce);
 static void __init df_mem_mm_states_init(void);
 static void df_mem_flip_pte_encoded_final(struct mm_struct *mm, unsigned long vaddr);
 static void df_mm_release_state(struct mm_struct *mm);
@@ -349,12 +349,12 @@ int df_mem_cow_page(struct page *new_page, struct page *old_page,
 	spin_lock(&pcpu->lock);
 
 	ret = df_sw_generate_keystream(pcpu, old_owner->df_ctx.seed_bytes,
-				       vaddr & PAGE_MASK, pcpu->decode_buf);
+				       vaddr & PAGE_MASK, 0, pcpu->decode_buf);
 	if (ret)
 		goto out;
 
 	ret = df_sw_generate_keystream(pcpu, new_owner->df_ctx.seed_bytes,
-				       vaddr & PAGE_MASK, pcpu->keystream);
+				       vaddr & PAGE_MASK, 0, pcpu->keystream);
 	if (ret)
 		goto out;
 
@@ -497,7 +497,7 @@ void df_mem_proc_read_encode(char *buf, size_t len,
 	pcpu = this_cpu_ptr(&df_mem_pcpu_data);
 	spin_lock(&pcpu->lock);
 
-	ret = df_sw_generate_keystream(pcpu, seed_bytes, page_addr, pcpu->keystream);
+	ret = df_sw_generate_keystream(pcpu, seed_bytes, page_addr, 0, pcpu->keystream);
 	if (ret) {
 		spin_unlock(&pcpu->lock);
 		return;
@@ -732,12 +732,22 @@ late_initcall(df_mem_init);
 struct df_active_page {
 	struct page *page;
 	unsigned long vaddr;
+	u32 encode_nonce;
+};
+
+#define DF_MEM_MAX_NONCES 64
+
+struct df_mem_nonce_entry {
+	unsigned long vaddr;
+	u32 nonce;
 };
 
 struct df_mem_mm_state {
 	struct mm_struct *owner;   /* mm that owns this bucket (NULL = free) */
 	struct df_active_page active[DF_MEM_MAX_ACTIVE_PAGES];
 	unsigned int count;
+	struct df_mem_nonce_entry encode_nonces[DF_MEM_MAX_NONCES];
+	unsigned int nonce_count;
 	spinlock_t lock;
 };
 
@@ -779,6 +789,59 @@ static struct df_mem_mm_state *df_mm_get_state(struct mm_struct *mm)
 }
 
 /*
+ * df_mm_store_nonce() -- Store encode nonce for a vaddr.
+ * Called from reencode_work after XOR encoding with a random nonce.
+ * Caller must hold state->lock.
+ */
+static void df_mm_store_nonce(struct df_mem_mm_state *state,
+			     unsigned long vaddr, u32 nonce)
+{
+	unsigned int i;
+
+	/* Update existing entry if present */
+	for (i = 0; i < state->nonce_count; i++) {
+		if (state->encode_nonces[i].vaddr == vaddr) {
+			state->encode_nonces[i].nonce = nonce;
+			return;
+		}
+	}
+	/* Add new entry */
+	if (state->nonce_count < DF_MEM_MAX_NONCES) {
+		state->encode_nonces[state->nonce_count].vaddr = vaddr;
+		state->encode_nonces[state->nonce_count].nonce = nonce;
+		state->nonce_count++;
+	} else {
+		pr_warn_ratelimited("dialectforge: nonce table full pid=%d\n",
+				    current->pid);
+	}
+}
+
+/*
+ * df_mm_lookup_nonce() -- Find the encode nonce for a vaddr.
+ * Returns 0 if not found (initial encode used nonce=0).
+ * Removes the entry after lookup (one-shot).
+ * Caller must hold state->lock.
+ */
+static u32 df_mm_lookup_nonce(struct df_mem_mm_state *state,
+			     unsigned long vaddr)
+{
+	unsigned int i;
+	u32 nonce;
+
+	for (i = 0; i < state->nonce_count; i++) {
+		if (state->encode_nonces[i].vaddr == vaddr) {
+			nonce = state->encode_nonces[i].nonce;
+			/* Remove by swapping with last */
+			state->encode_nonces[i] =
+				state->encode_nonces[state->nonce_count - 1];
+			state->nonce_count--;
+			return nonce;
+		}
+	}
+	return 0; /* not found = initial encode used nonce 0 */
+}
+
+/*
  * df_mm_release_state() -- Release ownership of a hash bucket.
  * Called when an mm is being destroyed (exit_mm, exec) so the
  * bucket can be reused by another process.
@@ -794,6 +857,7 @@ static void df_mm_release_state(struct mm_struct *mm)
 
 	spin_lock_irqsave(&state->lock, flags);
 	state->count = 0;
+	state->nonce_count = 0;
 	state->owner = NULL;
 	spin_unlock_irqrestore(&state->lock, flags);
 }
@@ -1120,10 +1184,18 @@ struct df_active_page *df_mem_pre_fork(struct mm_struct *mm,
 
 			/* XOR-decode outside spinlock */
 			if (!skip_xor) {
+				u32 dec_nonce = 0;
+				struct df_mem_mm_state *ns = df_mm_get_state(mm);
+				if (ns) {
+					unsigned long nf;
+					spin_lock_irqsave(&ns->lock, nf);
+					dec_nonce = df_mm_lookup_nonce(ns, addr);
+					spin_unlock_irqrestore(&ns->lock, nf);
+				}
 				pr_debug("df-xor-call: PRE-FORK-DECODE pfn=%lx vaddr=%lx pid=%d\n",
 					page_to_pfn(page), addr, current->pid);
 				df_sw_xor_page(page, current->df_ctx.seed_bytes,
-					       addr);
+					       addr, dec_nonce);
 			}
 
 			/* Re-acquire lock, flip PTE to PRESENT */
@@ -1438,9 +1510,17 @@ static void df_mem_reencode_work(struct callback_head *work)
 				continue;
 			}
 		}
-		df_sw_xor_page(snapshot[i].page,
-			       task->df_ctx.seed_bytes,
-			       snapshot[i].vaddr);
+		{
+			u32 enc_nonce;
+			get_random_bytes(&enc_nonce, sizeof(enc_nonce));
+			df_sw_xor_page(snapshot[i].page,
+				       task->df_ctx.seed_bytes,
+				       snapshot[i].vaddr, enc_nonce);
+			/* Store nonce so decode_fault can look it up */
+			spin_lock_irqsave(&state->lock, flags);
+			df_mm_store_nonce(state, snapshot[i].vaddr, enc_nonce);
+			spin_unlock_irqrestore(&state->lock, flags);
+		}
 		df_mem_flip_pte_encoded_final(task->mm, snapshot[i].vaddr);
 
 		/* Report RCU quiescent state after each page.
@@ -1565,7 +1645,8 @@ EXPORT_SYMBOL_GPL(df_mem_is_enabled);
  * never sleep (no crypto_alloc_shash in fault context). */
 static int df_sw_generate_keystream(struct df_mem_pcpu *pcpu,
 				    const u8 *seed_bytes,
-				    unsigned long page_addr, u8 *out)
+				    unsigned long page_addr, u32 nonce,
+				    u8 *out)
 {
 	struct shash_desc *desc;
 	u8 *counter_block = pcpu->counter_block;
@@ -1584,6 +1665,7 @@ static int df_sw_generate_keystream(struct df_mem_pcpu *pcpu,
 
 	memcpy(counter_block, seed_bytes, 32);
 	memcpy(counter_block + 32, &page_addr, sizeof(page_addr));
+	memcpy(counter_block + 44, &nonce, 4);
 
 	while (offset < PAGE_SIZE) {
 		unsigned int chunk = min_t(unsigned int, 32, PAGE_SIZE - offset);
@@ -1594,7 +1676,7 @@ static int df_sw_generate_keystream(struct df_mem_pcpu *pcpu,
 		if (ret)
 			break;
 		ret = crypto_shash_update(desc, counter_block,
-					  44);  /* 32 seed + 8 addr + 4 counter */
+					  48);  /* 32 seed + 8 addr + 4 counter + 4 nonce */
 		if (ret)
 			break;
 		ret = crypto_shash_final(desc, hash_out);
@@ -1607,12 +1689,12 @@ static int df_sw_generate_keystream(struct df_mem_pcpu *pcpu,
 	}
 
 	memzero_explicit(hash_out, 32);
-	memzero_explicit(counter_block, 44);
+	memzero_explicit(counter_block, 48);
 	return ret;
 }
 
 static int df_sw_xor_page(struct page *page, const u8 *seed_bytes,
-			   unsigned long vaddr)
+			   unsigned long vaddr, u32 nonce)
 {
 	struct df_mem_pcpu *pcpu;
 	u8 *page_data;
@@ -1623,7 +1705,7 @@ static int df_sw_xor_page(struct page *page, const u8 *seed_bytes,
 	spin_lock(&pcpu->lock);
 
 	ret = df_sw_generate_keystream(pcpu, seed_bytes, vaddr & PAGE_MASK,
-				       pcpu->keystream);
+				       nonce, pcpu->keystream);
 	if (ret)
 		goto out;
 
@@ -1677,7 +1759,7 @@ int df_mem_encode_page(struct page *page, struct task_struct *task,
 	task->df_ctx.mem_flags |= DF_MEMF_PAGES_ENCODED;
 	pr_debug("df-xor-call: ENCODE-ALLOC pfn=%lx vaddr=%lx pid=%d\n",
 		page_to_pfn(page), vaddr, task->pid);
-	return df_sw_xor_page(page, task->df_ctx.seed_bytes, vaddr);
+	return df_sw_xor_page(page, task->df_ctx.seed_bytes, vaddr, 0);
 }
 EXPORT_SYMBOL_GPL(df_mem_encode_page);
 
@@ -1690,7 +1772,7 @@ int df_mem_decode_page(struct page *page, struct task_struct *task,
 	df_mem_dbg("decode page %lx pid %d\n", vaddr, task->pid);
 	pr_debug("df-xor-call: DECODE-LEGACY pfn=%lx vaddr=%lx pid=%d\n",
 		page_to_pfn(page), vaddr, task->pid);
-	return df_sw_xor_page(page, task->df_ctx.seed_bytes, vaddr);
+	return df_sw_xor_page(page, task->df_ctx.seed_bytes, vaddr, 0);
 }
 EXPORT_SYMBOL_GPL(df_mem_decode_page);
 
@@ -1815,9 +1897,16 @@ static void df_mem_reencode_active(struct task_struct *task)
 				continue;
 			}
 		}
-		df_sw_xor_page(snapshot[i].page,
-			       task->df_ctx.seed_bytes,
-			       snapshot[i].vaddr);
+		{
+			u32 enc_nonce;
+			get_random_bytes(&enc_nonce, sizeof(enc_nonce));
+			df_sw_xor_page(snapshot[i].page,
+				       task->df_ctx.seed_bytes,
+				       snapshot[i].vaddr, enc_nonce);
+			spin_lock_irqsave(&state->lock, flags);
+			df_mm_store_nonce(state, snapshot[i].vaddr, enc_nonce);
+			spin_unlock_irqrestore(&state->lock, flags);
+		}
 		/* Walk page table and mark PTE as encoded */
 		df_mem_flip_pte_encoded_final(task->mm, snapshot[i].vaddr);
 
@@ -1872,7 +1961,17 @@ int df_mem_decode_fault(struct vm_fault *vmf)
 	page = folio_page(folio, 0);
 
 	/* Decode the page in-place (XOR is its own inverse) */
-	df_sw_xor_page(page, current->df_ctx.seed_bytes, addr);
+	{
+		u32 dec_nonce = 0;
+		struct df_mem_mm_state *ns = df_mm_get_state(current->mm);
+		if (ns) {
+			unsigned long nf;
+			spin_lock_irqsave(&ns->lock, nf);
+			dec_nonce = df_mm_lookup_nonce(ns, addr);
+			spin_unlock_irqrestore(&ns->lock, nf);
+		}
+		df_sw_xor_page(page, current->df_ctx.seed_bytes, addr, dec_nonce);
+	}
 
 	/* Track it so context switch can re-encode */
 	df_mm_track_decoded(current->mm, page, addr);
@@ -1973,6 +2072,10 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 	/* Pin the page so it can't vanish while we decode outside ptl */
 	get_page(page);
 
+	/* DF-004: nonce for page decode; set in !skip_xor path, reused if PTE race */
+	{
+	u32 dec_nonce = 0;
+
 	/* Check SOFTW3: protected-but-cleartext = skip expensive XOR.
 	 * This happens when task was scheduled out (PTEs protected fast)
 	 * but re-scheduled before task_work could XOR re-encode. */
@@ -1981,11 +2084,18 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 		spin_unlock(vmf->ptl);
 
 		if (!skip_xor) {
+			struct df_mem_mm_state *ns = df_mm_get_state(current->mm);
+			if (ns) {
+				unsigned long nf;
+				spin_lock_irqsave(&ns->lock, nf);
+				dec_nonce = df_mm_lookup_nonce(ns, vmf->address);
+				spin_unlock_irqrestore(&ns->lock, nf);
+			}
 			/* PHASE 2: Heavy crypto outside all spinlocks */
 			pr_debug("df-xor-call: DECODE-FAULT pfn=%lx vaddr=%lx pid=%d\n",
 				page_to_pfn(page), vmf->address, current->pid);
 			ret = df_sw_xor_page(page, current->df_ctx.seed_bytes,
-					     vmf->address);
+					     vmf->address, dec_nonce);
 			if (ret) {
 				pr_info("dialectforge: SIGBUS xor-fail pid=%d addr=%lx ret=%d\n",
 					current->pid, vmf->address, ret);
@@ -2011,10 +2121,22 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 		/* PTE raced â re-encode (XOR is symmetric) to restore */
 		pr_debug("df-xor-call: RACE-REVERT pfn=%lx vaddr=%lx pid=%d\n",
 			page_to_pfn(page), vmf->address, current->pid);
-		df_sw_xor_page(page, current->df_ctx.seed_bytes, vmf->address);
+		/* Race: re-encode with same nonce, then re-store it for retry */
+		df_sw_xor_page(page, current->df_ctx.seed_bytes, vmf->address, dec_nonce);
+		if (dec_nonce) {
+			struct df_mem_mm_state *ns2 = df_mm_get_state(current->mm);
+			if (ns2) {
+				unsigned long nf2;
+				spin_lock_irqsave(&ns2->lock, nf2);
+				df_mm_store_nonce(ns2, vmf->address, dec_nonce);
+				spin_unlock_irqrestore(&ns2->lock, nf2);
+			}
+		}
 		put_page(page);
 		return 0; /* Caller will retry the fault */
 	}
+
+	} /* end dec_nonce scope */
 
 	/* Flip PTE: PROTNONE+SOFTW2 â PRESENT.
 	 * Must use flip_protnone_guard to un-invert PFN bits â
@@ -2137,8 +2259,17 @@ void df_mem_decode_vma_range(struct mm_struct *mm, unsigned long start,
 		get_page(page);
 		spin_unlock(ptl);
 		/* XOR-decode outside spinlock (may sleep for keystream) */
-		if (!skip_xor)
-			df_sw_xor_page(page, current->df_ctx.seed_bytes, addr);
+		if (!skip_xor) {
+			u32 dec_nonce = 0;
+			struct df_mem_mm_state *ns = df_mm_get_state(mm);
+			if (ns) {
+				unsigned long nf;
+				spin_lock_irqsave(&ns->lock, nf);
+				dec_nonce = df_mm_lookup_nonce(ns, addr);
+				spin_unlock_irqrestore(&ns->lock, nf);
+			}
+			df_sw_xor_page(page, current->df_ctx.seed_bytes, addr, dec_nonce);
+		}
 
 		/* Re-acquire lock and flip PTE to PRESENT */
 		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
