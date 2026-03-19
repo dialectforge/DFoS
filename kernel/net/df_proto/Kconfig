@@ -1,0 +1,11 @@
+config DF_PROTO
+	tristate "DialectForge protocol family (AF_DIALECTFORGE)"
+	depends on DIALECTFORGE && NET
+	default y
+	help
+	  Register AF_DIALECTFORGE as a native protocol family.
+	  Processes can create DF sockets directly:
+	    socket(AF_DIALECTFORGE, SOCK_STREAM, 0)
+	  All communication is automatically dialect-encrypted.
+
+	  Copyright (c) 2026 John Dean Martin - Patent Pending

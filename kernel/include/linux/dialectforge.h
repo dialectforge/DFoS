@@ -225,6 +225,7 @@ bool df_negotiate_is_complete(const struct df_negotiation *neg);
  * ================================================================ */
 int df_anomaly_init(void);
 void df_anomaly_cleanup(void);
+void df_anomaly_clear_pid(pid_t pid);
 int df_anomaly_report(u32 event_type, u64 context_id);
 u64 df_anomaly_get_score(u64 context_id);
 int df_anomaly_reset(u64 context_id);
@@ -300,6 +301,7 @@ struct df_task_context {
 #define DF_TASKF_SEED_VALID     0x01    /* Seed has been initialized      */
 #define DF_TASKF_QUARANTINED    0x02    /* In quarantine zone             */
 #define DF_TASKF_PROMOTED       0x04    /* Was quarantine, now adopted    */
+#define DF_TASKF_CLEARTEXT      0x08    /* Translator mode: skip XOR      */
 
 /* Quarantine configuration */
 #define DF_QUARANTINE_TTL_DEFAULT_MS   300000  /* 5 minutes default TTL  */
@@ -340,6 +342,13 @@ struct df_net_peer *df_net_find_peer(__be32 ip);
 struct df_net_peer *df_net_handle_proposal(__be32 peer_ip, const u8 *their_seed);
 int  df_net_encode(struct df_net_peer *p, u8 *data, u32 len);
 int  df_net_decode(struct df_net_peer *p, u8 *data, u32 len);
+/* ══ Phase 4b: USB Auto-Quarantine ══ */
+int  df_usb_quarantine_init(void);
+void df_usb_quarantine_cleanup(void);
+extern bool df_install_mode;
+bool df_usb_is_boot_device(const char *devname);
+bool df_usb_is_quarantine_path(const char *path);
+
 /* ══ Phase 5: Memory Protection ══ */
 
 #define DF_MEMF_PAGES_ENCODED  (1 << 0)
@@ -394,5 +403,33 @@ int  df_kyber_seed_exchange(u8 *our_seed, const u8 *peer_pk,
 /* ── AF_DIALECTFORGE protocol ── */
 int  df_proto_init(void);
 void df_proto_exit(void);
+
+/* ══ Phase 7: Integrity Shield ══ */
+
+/* Protection flags for attested files */
+#define DF_PROTECT_WRITE     0x01  /* Block writes by non-root */
+#define DF_PROTECT_EXEC      0x02  /* Verify hash before exec */
+#define DF_PROTECT_IMMUTABLE 0x04  /* Block ALL writes, even root */
+#define DF_PROTECT_MONITOR   0x08  /* Log access, do not block */
+
+/* Attestation status */
+#define DF_ATTEST_UNKNOWN    0
+#define DF_ATTEST_VALID      1
+#define DF_ATTEST_TAMPERED   2
+#define DF_ATTEST_NEW        3
+
+/* Integrity Shield API — df/integrity.c */
+int  df_integrity_init(void);
+void df_integrity_cleanup(void);
+int  df_integrity_attest(const char *path, u32 protect_flags);
+int  df_integrity_verify(const char *path);
+int  df_integrity_check_write(const char *path, struct task_struct *task);
+int  df_integrity_check_exec(const char *path);
+
+/* Anomaly Engine v2 API additions — df/anomaly.c */
+int  df_anomaly_get_pid_score(pid_t pid);
+bool df_anomaly_is_locked_down(pid_t pid);
+void df_anomaly_cleanup(void);
+void df_anomaly_clear_pid(pid_t pid);
 
 #endif /* _LINUX_DIALECTFORGE_H */

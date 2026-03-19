@@ -27,6 +27,7 @@
 #include <linux/random.h>
 #include <linux/crypto.h>
 #include <crypto/hash.h>
+#include <crypto/internal/cipher.h>
 #include <linux/scatterlist.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -95,7 +96,7 @@ static bool df_mem_detect_amd(void)
 	cpuid(DF_AMD_CPUID_MEM_ENCRYPT, &eax, &ebx, &ecx, &edx);
 
 	if (!(eax & BIT(0))) {
-		pr_info("df_mem: AMD CPU, SME not supported by this model\n");
+		pr_debug("df_mem: AMD CPU, SME not supported by this model\n");
 		return false;
 	}
 
@@ -103,7 +104,7 @@ static bool df_mem_detect_amd(void)
 		return false;
 
 	if (!(msr_val & DF_MSR_AMD_SYSCFG_MEM_ENCRYPT)) {
-		pr_info("df_mem: AMD SME supported but not enabled "
+		pr_debug("df_mem: AMD SME supported but not enabled "
 			"(enable via BIOS or mem_encrypt=on)\n");
 		return false;
 	}
@@ -132,7 +133,7 @@ static bool df_mem_detect_intel(void)
 	cpuid_count(0x7, 0, &eax, &ebx, &ecx, &edx);
 
 	if (!(ecx & BIT(13))) {
-		pr_info("df_mem: Intel CPU, TME not supported by this model\n");
+		pr_debug("df_mem: Intel CPU, TME not supported by this model\n");
 		return false;
 	}
 
@@ -140,7 +141,7 @@ static bool df_mem_detect_intel(void)
 		return false;
 
 	if (!(msr_val & DF_MSR_IA32_TME_ACTIVATE_EN)) {
-		pr_info("df_mem: Intel TME supported but not enabled "
+		pr_debug("df_mem: Intel TME supported but not enabled "
 			"(enable in BIOS)\n");
 		return false;
 	}
@@ -160,25 +161,25 @@ static bool df_mem_detect_intel(void)
 
 static void df_mem_detect_hardware(void)
 {
-	pr_info("df_mem: Scanning for hardware memory encryption...\n");
+	pr_debug("df_mem: Scanning for hardware memory encryption...\n");
 
 	if (df_mem_detect_amd()) {
-		pr_info("df_mem: => %s\n",
+		pr_debug("df_mem: => %s\n",
 			df_mem_backend_names[df_mem_active_backend]);
 		return;
 	}
 
 	if (df_mem_detect_intel()) {
-		pr_info("df_mem: => %s\n",
+		pr_debug("df_mem: => %s\n",
 			df_mem_backend_names[df_mem_active_backend]);
 		if (df_mem_active_backend == DF_MEM_BACKEND_INTEL_MKTME)
-			pr_info("df_mem: MKTME key slots: %u\n",
+			pr_debug("df_mem: MKTME key slots: %u\n",
 				df_mem_mktme_num_keys);
 		return;
 	}
 
 	df_mem_active_backend = DF_MEM_BACKEND_SOFTWARE;
-	pr_info("df_mem: No hardware encryption => %s\n",
+	pr_debug("df_mem: No hardware encryption => %s\n",
 		df_mem_backend_names[DF_MEM_BACKEND_SOFTWARE]);
 }
 
@@ -200,20 +201,19 @@ struct df_mem_pcpu {
 	u8 decode_buf[PAGE_SIZE];
 	bool active;
 	spinlock_t lock;
-	/* Pre-allocated HMAC-SHA256 transform + desc (avoids sleeping
-	 * in page-fault context where crypto_alloc_shash is forbidden) */
-	struct crypto_shash *sw_tfm;
-	struct shash_desc *sw_desc;
-	/* Pre-allocated work buffers for keystream generation —
-	 * keeps 76+ bytes off the kernel stack in the page-fault path */
-	u8 counter_block[44]; /* seed(32) + addr(8) + ctr(4) */
-	u8 hash_out[32];
+	/* Pre-allocated AES-256-CTR cipher (uses AES-NI when available,
+	 * avoids sleeping in page-fault context) */
+	struct crypto_cipher *aes_tfm;
+	/* Pre-allocated work buffer for CTR counter block (16 bytes = AES block) */
+	u8 ctr_block[16]; /* 4 counter + 4 nonce + 8 addr */
 };
 
 static DEFINE_PER_CPU(struct df_mem_pcpu, df_mem_pcpu_data);
 
 static bool df_mem_initialized = false;
-static bool df_mem_enabled = true;  /* can be deferred via df.mem_defer=1 */
+static bool df_mem_enabled = false;  /* enabled via /proc/df_mem_enable after boot */
+static bool df_mem_defer_requested = false;  /* set by df.mem_defer=1 */
+static bool df_mem_permanently_off = false;  /* set by df.mem_off=1 or df.safemode=1 */
 
 static atomic64_t df_dma_blocked_count = ATOMIC64_INIT(0);
 static atomic64_t df_dma_flagged_count = ATOMIC64_INIT(0);
@@ -221,9 +221,9 @@ static atomic64_t df_dma_allowed_count = ATOMIC64_INIT(0);
 /* Forward declarations */
 static int df_sw_generate_keystream(struct df_mem_pcpu *pcpu,
                     const u8 *seed_bytes,
-                    unsigned long page_addr, u8 *out);
+                    unsigned long page_addr, u32 nonce, u8 *out);
 static int df_sw_xor_page(struct page *page, const u8 *seed_bytes,
-               unsigned long vaddr);
+               unsigned long vaddr, u32 nonce);
 static void __init df_mem_mm_states_init(void);
 static void df_mem_flip_pte_encoded_final(struct mm_struct *mm, unsigned long vaddr);
 static void df_mm_release_state(struct mm_struct *mm);
@@ -277,12 +277,14 @@ int df_mem_fork_init(struct task_struct *child, struct task_struct *parent)
 	 * between df_mem_enabled=true and seed_all_processes. */
 	if (!(parent->df_ctx.flags & DF_TASKF_SEED_VALID)) {
 		struct df_seed on_demand;
-		char label[32];
-		int ret;
+		u8 label[48];  /* 16 random + "pid:NNNNN" */
+		int label_len, ret;
 
-		snprintf(label, sizeof(label), "pid:%d", parent->pid);
+		get_random_bytes(label, 16);
+		label_len = 16 + snprintf((char *)label + 16, 32,
+					  "pid:%d", parent->pid);
 		ret = df_seed_derive_labeled(df_get_system_root_seed(),
-					     label, strlen(label),
+					     (char *)label, label_len,
 					     &on_demand);
 		if (ret) {
 			pr_warn("dialectforge: fork-init seed derivation failed pid %d: %d\n",
@@ -301,7 +303,7 @@ int df_mem_fork_init(struct task_struct *child, struct task_struct *parent)
 		smp_wmb();
 		parent->df_ctx.flags       |= DF_TASKF_SEED_VALID;
 		task_unlock(parent);
-		pr_info("dialectforge: on-demand seed for parent pid %d\n",
+		pr_debug("dialectforge: on-demand seed for parent pid %d\n",
 			parent->pid);
 	}
 
@@ -349,12 +351,12 @@ int df_mem_cow_page(struct page *new_page, struct page *old_page,
 	spin_lock(&pcpu->lock);
 
 	ret = df_sw_generate_keystream(pcpu, old_owner->df_ctx.seed_bytes,
-				       vaddr & PAGE_MASK, pcpu->decode_buf);
+				       vaddr & PAGE_MASK, 0, pcpu->decode_buf);
 	if (ret)
 		goto out;
 
 	ret = df_sw_generate_keystream(pcpu, new_owner->df_ctx.seed_bytes,
-				       vaddr & PAGE_MASK, pcpu->keystream);
+				       vaddr & PAGE_MASK, 0, pcpu->keystream);
 	if (ret)
 		goto out;
 
@@ -405,7 +407,7 @@ static int df_mem_proc_show(struct seq_file *m, void *v)
 
 	seq_puts(m, "=== DialectForge Memory Protection ===\n");
 	seq_printf(m, "Status:       %s\n",
-		   df_mem_initialized ? "ACTIVE" : "INIT");
+		   df_mem_enabled ? "ENABLED" : (df_mem_initialized ? "READY (awaiting enable)" : "INIT"));
 	seq_printf(m, "Backend:      %s\n",
 		   df_mem_backend_names[df_mem_active_backend]);
 
@@ -438,7 +440,7 @@ static int df_mem_proc_show(struct seq_file *m, void *v)
 	}
 
 	seq_puts(m, "Context wipe: max (TLB + cache flush)\n");
-	seq_printf(m, "DMA protect:  active (allowed=%lld blocked=%lld flagged=%lld)\n",
+	seq_printf(m, "DMA protect:  monitoring (allowed=%lld blocked=%lld flagged=%lld)\n",
 		 (long long)atomic64_read(&df_dma_allowed_count),
 		 (long long)atomic64_read(&df_dma_blocked_count),
 		 (long long)atomic64_read(&df_dma_flagged_count));
@@ -497,7 +499,7 @@ void df_mem_proc_read_encode(char *buf, size_t len,
 	pcpu = this_cpu_ptr(&df_mem_pcpu_data);
 	spin_lock(&pcpu->lock);
 
-	ret = df_sw_generate_keystream(pcpu, seed_bytes, page_addr, pcpu->keystream);
+	ret = df_sw_generate_keystream(pcpu, seed_bytes, page_addr, 0, pcpu->keystream);
 	if (ret) {
 		spin_unlock(&pcpu->lock);
 		return;
@@ -524,11 +526,36 @@ static int __init df_mem_defer_setup(char *str)
 {
 	if (str && *str == '1') {
 		df_mem_enabled = false;
+		df_mem_defer_requested = true;
 		pr_info("DialectForge: Memory protection deferred (df.mem_defer=1)\n");
 	}
 	return 1;
 }
 __setup("df.mem_defer=", df_mem_defer_setup);
+
+static int __init df_mem_off_setup(char *str)
+{
+	if (str && *str == '1') {
+		df_mem_enabled = false;
+		df_mem_defer_requested = false;
+		df_mem_permanently_off = true;
+		pr_info("DialectForge: Memory protection DISABLED by boot param (df.mem_off=1)\n");
+	}
+	return 1;
+}
+__setup("df.mem_off=", df_mem_off_setup);
+
+static int __init df_mem_safemode_setup(char *str)
+{
+	if (str && *str == '1') {
+		df_mem_enabled = false;
+		df_mem_defer_requested = false;
+		df_mem_permanently_off = true;
+		pr_info("DialectForge: SAFE MODE - memory protection disabled, network disabled\n");
+	}
+	return 1;
+}
+__setup("df.safemode=", df_mem_safemode_setup);
 
 /* ---- Seed-on-enable: derive seeds for all deferred processes ---- */
 #define DF_MAX_DEFERRED_PIDS 4096
@@ -539,18 +566,20 @@ static int df_mem_seed_all_processes(void)
 	int count = 0, i, seeded = 0, ret;
 	struct task_struct *p;
 	struct df_seed child_seed;
-	char label[32];
+	u8 label[48];  /* 16 random + "pid:NNNNN" */
+	int label_len;
 
 	pids = kmalloc_array(DF_MAX_DEFERRED_PIDS, sizeof(pid_t), GFP_KERNEL);
 	if (!pids)
 		return -ENOMEM;
 
-	/* Phase 1: Collect seedless PIDs under RCU */
+	/* Phase 1: Collect ALL userspace PIDs under RCU.
+	 * We do NOT skip DF_TASKF_SEED_VALID because during deferred boot,
+	 * dup_task_struct copies the parent's flags including SEED_VALID.
+	 * All processes share init's seed — each needs a unique one. */
 	rcu_read_lock();
 	for_each_process(p) {
-		if (!p->mm)
-			continue;
-		if (p->df_ctx.flags & DF_TASKF_SEED_VALID)
+		if (!p->mm)				/* skip kernel threads */
 			continue;
 		if (count < DF_MAX_DEFERRED_PIDS)
 			pids[count++] = p->pid;
@@ -570,14 +599,13 @@ static int df_mem_seed_all_processes(void)
 		get_task_struct(p);
 		rcu_read_unlock();
 
-		if (p->df_ctx.flags & DF_TASKF_SEED_VALID) {
-			put_task_struct(p);
-			continue;
-		}
+		/* Always re-seed: inherited SEED_VALID is stale */
 
-		snprintf(label, sizeof(label), "pid:%d", pids[i]);
+		get_random_bytes(label, 16);
+		label_len = 16 + snprintf((char *)label + 16, 32,
+					  "pid:%d", pids[i]);
 		ret = df_seed_derive_labeled(df_get_system_root_seed(),
-					     label, strlen(label),
+					     (char *)label, label_len,
 					     &child_seed);
 		if (ret) {
 			pr_warn("dialectforge: seed derivation failed pid %d: %d\n",
@@ -608,31 +636,14 @@ static int df_mem_seed_all_processes(void)
 	return 0;
 }
 
-static ssize_t df_mem_enable_write(struct file *file,
-				   const char __user *buf,
-				   size_t count, loff_t *ppos)
-{
-	char c;
-	pr_debug("dialectforge: enable_write called count=%zu enabled=%d\n", count, df_mem_enabled);
-	if (count < 1)
-		return -EINVAL;
-	if (get_user(c, buf))
-		return -EFAULT;
-	if (c == '1' && !df_mem_enabled) {
-		/* Seed all processes BEFORE enabling protection.
-		 * This closes the race window -- any fork during
-		 * seeding inherits from an already-seeded parent
-		 * via the on-demand path in fork_init. */
-		df_mem_seed_all_processes();
-		smp_wmb();
-		df_mem_enabled = true;
-		pr_debug("dialectforge: memory protection enabled\n");
-	} else if (c == '0') {
-		df_mem_enabled = false;
-		pr_debug("dialectforge: memory protection disabled\n");
-	}
-	return count;
-}
+/* /proc/df_mem_enable: read shows status, write '1' enables protection.
+ * ENABLE-ONLY: once activated, protection cannot be disabled at runtime.
+ * This preserves the GRUB-controlled security model:
+ *   df.mem_off=1   — permanently off (GRUB superuser required)
+ *   df.safemode=1  — permanently off (GRUB superuser required)
+ *   Default boot   — off until dfos-init.service writes '1' here
+ * Security: /proc/df_mem_enable is root-writable, enable-only.
+ * An attacker with root CANNOT disable protection once active. */
 
 static int df_mem_enable_show(struct seq_file *m, void *v)
 {
@@ -643,6 +654,38 @@ static int df_mem_enable_show(struct seq_file *m, void *v)
 static int df_mem_enable_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, df_mem_enable_show, NULL);
+}
+
+static ssize_t df_mem_enable_write(struct file *file,
+				   const char __user *buf,
+				   size_t count, loff_t *ppos)
+{
+	char c;
+	if (count < 1)
+		return -EINVAL;
+	if (get_user(c, buf))
+		return -EFAULT;
+	if (c == '1' && !df_mem_enabled) {
+		if (!capable(CAP_SYS_ADMIN)) {
+			pr_warn("DialectForge: enable blocked (no CAP_SYS_ADMIN)\n");
+			return -EPERM;
+		}
+		if (df_mem_permanently_off) {
+			pr_warn("DialectForge: enable blocked (df.mem_off or df.safemode)\n");
+			return -EPERM;
+		}
+		if (!df_mem_initialized) {
+			pr_warn("DialectForge: enable blocked (not initialized)\n");
+			return -EAGAIN;
+		}
+		/* Seed all running processes BEFORE enabling protection */
+		df_mem_seed_all_processes();
+		smp_wmb();
+		df_mem_enabled = true;
+		pr_info("DialectForge: Memory protection ENABLED (enable-only, no runtime disable)\n");
+	}
+	/* Silently ignore '0' and re-writes of '1' — no disable path */
+	return count;
 }
 
 static const struct proc_ops df_mem_enable_proc_ops = {
@@ -663,53 +706,69 @@ static int __init df_mem_init(void)
 
 	for_each_possible_cpu(cpu) {
 		struct df_mem_pcpu *pcpu = per_cpu_ptr(&df_mem_pcpu_data, cpu);
-		struct crypto_shash *tfm;
+		struct crypto_cipher *tfm;
 
 		spin_lock_init(&pcpu->lock);
 		memset(pcpu->keystream, 0, DF_MEM_KEYSTREAM_BYTES);
 		memset(pcpu->decode_buf, 0, PAGE_SIZE);
 		pcpu->active = false;
 
-		/* Pre-allocate HMAC-SHA256 transform per CPU so the
-		 * keystream generator never has to sleep. */
-		tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+		/* Pre-allocate AES-256 cipher per CPU.
+		 * With -cpu host, kernel auto-selects AES-NI. */
+		tfm = crypto_alloc_cipher("aes", 0, 0);
 		if (IS_ERR(tfm)) {
-			pr_err("df_mem: CPU%d: crypto_alloc_shash failed: %ld\n",
+			pr_err("df_mem: CPU%d: crypto_alloc_cipher(aes) failed: %ld\n",
 			       cpu, PTR_ERR(tfm));
-			pcpu->sw_tfm = NULL;
-			pcpu->sw_desc = NULL;
+			pcpu->aes_tfm = NULL;
 			continue;
 		}
-		pcpu->sw_tfm = tfm;
-		pcpu->sw_desc = kzalloc(sizeof(struct shash_desc) +
-					crypto_shash_descsize(tfm), GFP_KERNEL);
-		if (!pcpu->sw_desc) {
-			pr_err("df_mem: CPU%d: shash_desc alloc failed\n", cpu);
-			crypto_free_shash(tfm);
-			pcpu->sw_tfm = NULL;
-			continue;
-		}
-		pcpu->sw_desc->tfm = tfm;
+		pcpu->aes_tfm = tfm;
 	}
 
-	if (!proc_create("df_mem", 0444, NULL, &df_mem_proc_ops))
+	if (!proc_create("df_mem", 0400, NULL, &df_mem_proc_ops))
 		pr_warn("df_mem: /proc/df_mem creation failed\n");
-	if (!proc_create("df_mem_enable", 0644, NULL, &df_mem_enable_proc_ops))
+	if (!proc_create("df_mem_enable", 0200, NULL, &df_mem_enable_proc_ops))
 		pr_warn("df_mem: /proc/df_mem_enable creation failed\n");
 
 	df_mem_mm_states_init();
 	df_mem_initialized = true;
 
-	pr_info("DialectForge: Memory Protection ACTIVE\n");
-	pr_info("  Backend:      %s\n",
+	if (df_mem_enabled)
+		pr_info("DialectForge: Memory Protection ACTIVE\n");
+	else if (df_mem_permanently_off)
+		pr_info("DialectForge: Memory Protection OFF (boot param)\n");
+	else
+		pr_info("DialectForge: Memory Protection READY (awaiting /proc/df_mem_enable)\n");
+
+	/* Harden sysctl defaults for DFoS */
+	{
+		extern int kptr_restrict;
+		kptr_restrict = 2;  /* hide kernel pointers even from root */
+	}
+	pr_debug("  Backend:      %s\n",
 		df_mem_backend_names[df_mem_active_backend]);
-	pr_info("  Context wipe: max (TLB + cache flush)\n");
-	pr_info("  DMA:          active protection (block decoded, flag incoming)\n");
+	pr_debug("  Context wipe: max (TLB + cache flush)\n");
+	pr_debug("  DMA:          active protection (block decoded, flag incoming)\n");
 
 	return 0;
 }
 
 late_initcall(df_mem_init);
+
+/* ---- Deferred auto-activation -----------------------------------
+ * When df.mem_defer=1, protection starts disabled so early-boot
+ * processes can run unseeded.  This late_initcall_sync seeds every
+ * existing process and flips protection on — no userspace write
+ * to /proc needed.  Runs after all late_initcalls complete.
+ */
+/* Deferred auto-activation removed — protection is now enabled
+ * exclusively via /proc/df_mem_enable (enable-only, root-writable).
+ * dfos-init.service writes '1' After=multi-user.target to ensure
+ * all daemons are running and seedable before activation.
+ * Security: once enabled, protection cannot be disabled at runtime.
+ * Only GRUB boot params (df.mem_off=1, df.safemode=1) can prevent it.
+ * The df.mem_defer=1 boot param is now a no-op (default is off). */
+
 
 
 /* ============================================================
@@ -732,12 +791,27 @@ late_initcall(df_mem_init);
 struct df_active_page {
 	struct page *page;
 	unsigned long vaddr;
+	u32 encode_nonce;
+};
+
+#define DF_NONCE_INIT_CAP  64
+#define DF_NONCE_MAX_CAP   16384
+
+struct df_mem_nonce_entry {
+	unsigned long vaddr;
+	u32 nonce;
 };
 
 struct df_mem_mm_state {
 	struct mm_struct *owner;   /* mm that owns this bucket (NULL = free) */
 	struct df_active_page active[DF_MEM_MAX_ACTIVE_PAGES];
 	unsigned int count;
+	struct df_mem_nonce_entry *encode_nonces;
+	unsigned int nonce_count;
+	unsigned int nonce_capacity;
+	/* Fault rate limiting: kill process if > threshold faults/sec */
+	unsigned int fault_count;
+	unsigned long fault_window_start;  /* jiffies */
 	spinlock_t lock;
 };
 
@@ -767,6 +841,16 @@ static struct df_mem_mm_state *df_mm_get_state(struct mm_struct *mm)
 
 	/* Bucket is free -- claim it */
 	if (state->owner == NULL) {
+		if (!state->encode_nonces) {
+			state->encode_nonces = kmalloc_array(
+				DF_NONCE_INIT_CAP,
+				sizeof(struct df_mem_nonce_entry),
+				GFP_ATOMIC);
+			if (!state->encode_nonces)
+				return NULL;
+			state->nonce_capacity = DF_NONCE_INIT_CAP;
+			state->nonce_count = 0;
+		}
 		state->owner = mm;
 		return state;
 	}
@@ -776,6 +860,86 @@ static struct df_mem_mm_state *df_mm_get_state(struct mm_struct *mm)
 	pr_info_once("dialectforge: hash collision mm=%px hash=%lu owner=%px\n",
 		     mm, hash, state->owner);
 	return NULL;
+}
+
+/*
+ * df_mm_store_nonce() -- Store encode nonce for a vaddr.
+ * Called from reencode_work after XOR encoding with a random nonce.
+ * Caller must hold state->lock.
+ */
+static void df_mm_store_nonce(struct df_mem_mm_state *state,
+			     unsigned long vaddr, u32 nonce)
+{
+	unsigned int i;
+
+	/* Update existing entry if present */
+	for (i = 0; i < state->nonce_count; i++) {
+		if (state->encode_nonces[i].vaddr == vaddr) {
+			state->encode_nonces[i].nonce = nonce;
+			return;
+		}
+	}
+	/* Add new entry -- grow table if needed */
+	if (state->nonce_count < state->nonce_capacity) {
+		state->encode_nonces[state->nonce_count].vaddr = vaddr;
+		state->encode_nonces[state->nonce_count].nonce = nonce;
+		state->nonce_count++;
+	} else if (state->nonce_capacity < DF_NONCE_MAX_CAP) {
+		/* Double capacity via krealloc */
+		unsigned int new_cap = state->nonce_capacity * 2;
+		struct df_mem_nonce_entry *tmp;
+		if (new_cap > DF_NONCE_MAX_CAP)
+			new_cap = DF_NONCE_MAX_CAP;
+		tmp = krealloc(state->encode_nonces,
+			new_cap * sizeof(struct df_mem_nonce_entry),
+			GFP_ATOMIC);
+		if (tmp) {
+			state->encode_nonces = tmp;
+			state->nonce_capacity = new_cap;
+			state->encode_nonces[state->nonce_count].vaddr = vaddr;
+			state->encode_nonces[state->nonce_count].nonce = nonce;
+			state->nonce_count++;
+		} else {
+			/* krealloc failed -- round-robin evict */
+			static unsigned int nonce_evict_idx;
+			unsigned int idx = nonce_evict_idx % state->nonce_capacity;
+			state->encode_nonces[idx].vaddr = vaddr;
+			state->encode_nonces[idx].nonce = nonce;
+			nonce_evict_idx++;
+		}
+	} else {
+		/* At hard cap -- round-robin evict */
+		static unsigned int nonce_evict_idx;
+		unsigned int idx = nonce_evict_idx % state->nonce_capacity;
+		state->encode_nonces[idx].vaddr = vaddr;
+		state->encode_nonces[idx].nonce = nonce;
+		nonce_evict_idx++;
+	}
+}
+
+/*
+ * df_mm_lookup_nonce() -- Find the encode nonce for a vaddr.
+ * Returns 0 if not found (initial encode used nonce=0).
+ * Removes the entry after lookup (one-shot).
+ * Caller must hold state->lock.
+ */
+static u32 df_mm_lookup_nonce(struct df_mem_mm_state *state,
+			     unsigned long vaddr)
+{
+	unsigned int i;
+	u32 nonce;
+
+	for (i = 0; i < state->nonce_count; i++) {
+		if (state->encode_nonces[i].vaddr == vaddr) {
+			nonce = state->encode_nonces[i].nonce;
+			/* Remove by swapping with last */
+			state->encode_nonces[i] =
+				state->encode_nonces[state->nonce_count - 1];
+			state->nonce_count--;
+			return nonce;
+		}
+	}
+	return 0; /* not found = initial encode used nonce 0 */
 }
 
 /*
@@ -794,6 +958,10 @@ static void df_mm_release_state(struct mm_struct *mm)
 
 	spin_lock_irqsave(&state->lock, flags);
 	state->count = 0;
+	state->nonce_count = 0;
+	kfree(state->encode_nonces);
+	state->encode_nonces = NULL;
+	state->nonce_capacity = 0;
 	state->owner = NULL;
 	spin_unlock_irqrestore(&state->lock, flags);
 }
@@ -865,12 +1033,12 @@ int df_mem_dma_check(struct page *page, enum dma_data_direction dir,
 		 */
 		if (decoded) {
 			pr_warn_ratelimited(
-				"dialectforge: DMA TO_DEVICE BLOCKED pfn=%lx "
+				"dialectforge: DMA TO_DEVICE FLAGGED pfn=%lx "
 				"dev=%s — page is decoded (cleartext)\n",
 				page_to_pfn(page),
 				dev ? dev_name(dev) : "?");
-			atomic64_inc(&df_dma_blocked_count);
-			return -EACCES;
+			atomic64_inc(&df_dma_flagged_count);
+			/* v1.0: monitor only — real DMA protection in Phase 7 (IOMMU) */
 		}
 		/* Page is encoded => DMA sees noise.  Allow. */
 		atomic64_inc(&df_dma_allowed_count);
@@ -884,7 +1052,7 @@ int df_mem_dma_check(struct page *page, enum dma_data_direction dir,
 		 * when the owning process next accesses it.
 		 */
 		if (page_count(page) > 0) {
-			pr_info_ratelimited(
+			pr_debug(
 				"dialectforge: DMA FROM_DEVICE pfn=%lx dev=%s "
 				"— cleartext written, re-encode on access\n",
 				page_to_pfn(page),
@@ -898,12 +1066,12 @@ int df_mem_dma_check(struct page *page, enum dma_data_direction dir,
 		/* Both directions — apply TO_DEVICE check */
 		if (decoded) {
 			pr_warn_ratelimited(
-				"dialectforge: DMA BIDIR BLOCKED pfn=%lx "
+				"dialectforge: DMA BIDIR FLAGGED pfn=%lx "
 				"dev=%s — page decoded\n",
 				page_to_pfn(page),
 				dev ? dev_name(dev) : "?");
-			atomic64_inc(&df_dma_blocked_count);
-			return -EACCES;
+			atomic64_inc(&df_dma_flagged_count);
+			/* v1.0: monitor only */
 		}
 		atomic64_inc(&df_dma_allowed_count);
 		break;
@@ -1120,10 +1288,18 @@ struct df_active_page *df_mem_pre_fork(struct mm_struct *mm,
 
 			/* XOR-decode outside spinlock */
 			if (!skip_xor) {
+				u32 dec_nonce = 0;
+				struct df_mem_mm_state *ns = df_mm_get_state(mm);
+				if (ns) {
+					unsigned long nf;
+					spin_lock_irqsave(&ns->lock, nf);
+					dec_nonce = df_mm_lookup_nonce(ns, addr);
+					spin_unlock_irqrestore(&ns->lock, nf);
+				}
 				pr_debug("df-xor-call: PRE-FORK-DECODE pfn=%lx vaddr=%lx pid=%d\n",
 					page_to_pfn(page), addr, current->pid);
 				df_sw_xor_page(page, current->df_ctx.seed_bytes,
-					       addr);
+					       addr, dec_nonce);
 			}
 
 			/* Re-acquire lock, flip PTE to PRESENT */
@@ -1438,9 +1614,17 @@ static void df_mem_reencode_work(struct callback_head *work)
 				continue;
 			}
 		}
-		df_sw_xor_page(snapshot[i].page,
-			       task->df_ctx.seed_bytes,
-			       snapshot[i].vaddr);
+		{
+			u32 enc_nonce;
+			get_random_bytes(&enc_nonce, sizeof(enc_nonce));
+			df_sw_xor_page(snapshot[i].page,
+				       task->df_ctx.seed_bytes,
+				       snapshot[i].vaddr, enc_nonce);
+			/* Store nonce so decode_fault can look it up */
+			spin_lock_irqsave(&state->lock, flags);
+			df_mm_store_nonce(state, snapshot[i].vaddr, enc_nonce);
+			spin_unlock_irqrestore(&state->lock, flags);
+		}
 		df_mem_flip_pte_encoded_final(task->mm, snapshot[i].vaddr);
 
 		/* Report RCU quiescent state after each page.
@@ -1453,9 +1637,12 @@ static void df_mem_reencode_work(struct callback_head *work)
 		 * lets the grace period advance. At this point we
 		 * are outside all RCU read-side critical sections
 		 * (pte_unmap_unlock already called rcu_read_unlock). */
-		local_irq_save(flags);
-		rcu_momentary_eqs();
-		local_irq_restore(flags);
+		/* Report RCU quiescent state only if outside RCU */
+		if (!rcu_preempt_depth()) {
+			local_irq_save(flags);
+			rcu_momentary_eqs();
+			local_irq_restore(flags);
+		}
 	}
 
 	/* Clear pending flag NOW so schedule_protect can queue next time.
@@ -1559,60 +1746,50 @@ EXPORT_SYMBOL_GPL(df_mem_is_enabled);
 /* ============================================================
  * SECTION 3: Software Backend — Keystream Engine
  * ============================================================ */
-
 /* Caller MUST hold pcpu->lock and pass the pcpu pointer.
- * Uses pre-allocated per-CPU HMAC-SHA256 transform so we
- * never sleep (no crypto_alloc_shash in fault context). */
+ * Uses pre-allocated per-CPU AES-256 cipher in CTR mode.
+ * With AES-NI (-cpu host), this is hardware-accelerated.
+ * Counter block layout (16 bytes): [4 counter | 4 nonce | 8 addr] */
 static int df_sw_generate_keystream(struct df_mem_pcpu *pcpu,
 				    const u8 *seed_bytes,
-				    unsigned long page_addr, u8 *out)
+				    unsigned long page_addr, u32 nonce,
+				    u8 *out)
 {
-	struct shash_desc *desc;
-	u8 *counter_block = pcpu->counter_block;
-	u8 *hash_out = pcpu->hash_out;
+	u8 *ctr = pcpu->ctr_block;
 	unsigned int offset = 0;
 	u32 counter = 0;
 	int ret;
 
-	if (unlikely(!pcpu->sw_tfm || !pcpu->sw_desc))
+	if (unlikely(!pcpu->aes_tfm))
 		return -ENODEV;
 
-	desc = pcpu->sw_desc;
-	ret = crypto_shash_setkey(pcpu->sw_tfm, seed_bytes, 32);
+	/* Set the 256-bit key (seed) */
+	ret = crypto_cipher_setkey(pcpu->aes_tfm, seed_bytes, 32);
 	if (ret)
 		return ret;
 
-	memcpy(counter_block, seed_bytes, 32);
-	memcpy(counter_block + 32, &page_addr, sizeof(page_addr));
+	/* Build the static part of the counter block:
+	 * [0..3]  = counter (changes each iteration)
+	 * [4..7]  = nonce
+	 * [8..15] = page virtual address */
+	memset(ctr, 0, 16);
+	memcpy(ctr + 4, &nonce, 4);
+	memcpy(ctr + 8, &page_addr, sizeof(page_addr));
 
+	/* Generate PAGE_SIZE bytes of keystream: 256 x AES-ECB(key, ctr++) */
 	while (offset < PAGE_SIZE) {
-		unsigned int chunk = min_t(unsigned int, 32, PAGE_SIZE - offset);
-
-		memcpy(counter_block + 40, &counter, 4);
-
-		ret = crypto_shash_init(desc);
-		if (ret)
-			break;
-		ret = crypto_shash_update(desc, counter_block,
-					  44);  /* 32 seed + 8 addr + 4 counter */
-		if (ret)
-			break;
-		ret = crypto_shash_final(desc, hash_out);
-		if (ret)
-			break;
-
-		memcpy(out + offset, hash_out, chunk);
-		offset += chunk;
+		memcpy(ctr, &counter, 4);
+		crypto_cipher_encrypt_one(pcpu->aes_tfm, out + offset, ctr);
+		offset += 16;  /* AES block = 16 bytes */
 		counter++;
 	}
 
-	memzero_explicit(hash_out, 32);
-	memzero_explicit(counter_block, 44);
-	return ret;
+	memzero_explicit(ctr, 16);
+	return 0;
 }
 
 static int df_sw_xor_page(struct page *page, const u8 *seed_bytes,
-			   unsigned long vaddr)
+			   unsigned long vaddr, u32 nonce)
 {
 	struct df_mem_pcpu *pcpu;
 	u8 *page_data;
@@ -1623,7 +1800,7 @@ static int df_sw_xor_page(struct page *page, const u8 *seed_bytes,
 	spin_lock(&pcpu->lock);
 
 	ret = df_sw_generate_keystream(pcpu, seed_bytes, vaddr & PAGE_MASK,
-				       pcpu->keystream);
+				       nonce, pcpu->keystream);
 	if (ret)
 		goto out;
 
@@ -1677,7 +1854,7 @@ int df_mem_encode_page(struct page *page, struct task_struct *task,
 	task->df_ctx.mem_flags |= DF_MEMF_PAGES_ENCODED;
 	pr_debug("df-xor-call: ENCODE-ALLOC pfn=%lx vaddr=%lx pid=%d\n",
 		page_to_pfn(page), vaddr, task->pid);
-	return df_sw_xor_page(page, task->df_ctx.seed_bytes, vaddr);
+	return df_sw_xor_page(page, task->df_ctx.seed_bytes, vaddr, 0);
 }
 EXPORT_SYMBOL_GPL(df_mem_encode_page);
 
@@ -1690,7 +1867,7 @@ int df_mem_decode_page(struct page *page, struct task_struct *task,
 	df_mem_dbg("decode page %lx pid %d\n", vaddr, task->pid);
 	pr_debug("df-xor-call: DECODE-LEGACY pfn=%lx vaddr=%lx pid=%d\n",
 		page_to_pfn(page), vaddr, task->pid);
-	return df_sw_xor_page(page, task->df_ctx.seed_bytes, vaddr);
+	return df_sw_xor_page(page, task->df_ctx.seed_bytes, vaddr, 0);
 }
 EXPORT_SYMBOL_GPL(df_mem_decode_page);
 
@@ -1742,9 +1919,14 @@ void df_mem_schedule_protect(struct task_struct *task)
 		init_task_work(&task->df_ctx.reencode_work, df_mem_reencode_work);
 		ret = task_work_add(task, &task->df_ctx.reencode_work, TWA_RESUME);
 		if (ret) {
-			/* Task exiting -- fall back to synchronous re-encode */
+			/* Task exiting -- fall back to synchronous re-encode.
+			 * But NEVER do sync crypto if caller holds RCU --
+			 * the SHA keystream generation is too slow and
+			 * rcu_momentary_eqs() inside RCU is illegal.
+			 * Pages stay decoded for one cycle (safe). */
 			task->df_ctx.mem_flags &= ~DF_MEMF_REENCODE_PENDING;
-			df_mem_reencode_active(task);
+			if (!rcu_preempt_depth())
+				df_mem_reencode_active(task);
 		}
 	}
 }
@@ -1765,6 +1947,17 @@ static void df_mem_reencode_active(struct task_struct *task)
 
 	if (!task->mm)
 		return;
+
+	/* Never do heavy crypto inside an RCU read-side critical section.
+	 * df_sw_xor_page does 128 SHA rounds per page -- if we run that
+	 * while RCU is held, synchronize_rcu() callers (cgroups, etc)
+	 * deadlock forever waiting for the grace period.  Pages stay
+	 * decoded for one schedule cycle (safe but unprotected). */
+	if (rcu_preempt_depth()) {
+		pr_debug("dialectforge: skip reencode-active inside RCU pid=%d\n",
+			task->pid);
+		return;
+	}
 
 	state = df_mm_get_state(task->mm);
 	if (!state)
@@ -1815,16 +2008,25 @@ static void df_mem_reencode_active(struct task_struct *task)
 				continue;
 			}
 		}
-		df_sw_xor_page(snapshot[i].page,
-			       task->df_ctx.seed_bytes,
-			       snapshot[i].vaddr);
+		{
+			u32 enc_nonce;
+			get_random_bytes(&enc_nonce, sizeof(enc_nonce));
+			df_sw_xor_page(snapshot[i].page,
+				       task->df_ctx.seed_bytes,
+				       snapshot[i].vaddr, enc_nonce);
+			spin_lock_irqsave(&state->lock, flags);
+			df_mm_store_nonce(state, snapshot[i].vaddr, enc_nonce);
+			spin_unlock_irqrestore(&state->lock, flags);
+		}
 		/* Walk page table and mark PTE as encoded */
 		df_mem_flip_pte_encoded_final(task->mm, snapshot[i].vaddr);
 
-		/* Report RCU quiescent state (see reencode_work comment) */
-		local_irq_save(flags);
-		rcu_momentary_eqs();
-		local_irq_restore(flags);
+		/* Report RCU quiescent state only if outside RCU */
+		if (!rcu_preempt_depth()) {
+			local_irq_save(flags);
+			rcu_momentary_eqs();
+			local_irq_restore(flags);
+		}
 	}
 }
 
@@ -1858,6 +2060,30 @@ int df_mem_decode_fault(struct vm_fault *vmf)
 	if (!(current->df_ctx.mem_flags & DF_MEMF_PAGES_ENCODED))
 		return -1;
 
+	/* Rate limit: kill process doing > 1000 decode faults per second */
+	{
+		struct df_mem_mm_state *rl = df_mm_get_state(current->mm);
+		if (rl) {
+			unsigned long now = jiffies;
+			spin_lock(&rl->lock);
+			if (time_after(now, rl->fault_window_start + HZ)) {
+				rl->fault_count = 1;
+				rl->fault_window_start = now;
+			} else {
+				rl->fault_count++;
+				if (rl->fault_count > 1000) {
+					spin_unlock(&rl->lock);
+					pr_warn_ratelimited(
+						"dialectforge: pid %d exceeded fault rate limit, killing\n",
+						current->pid);
+					force_sig(SIGKILL);
+					return -1;
+				}
+			}
+			spin_unlock(&rl->lock);
+		}
+	}
+
 	/* Get the page from the PTE */
 	if (!vmf->pte)
 		return -1;
@@ -1872,7 +2098,17 @@ int df_mem_decode_fault(struct vm_fault *vmf)
 	page = folio_page(folio, 0);
 
 	/* Decode the page in-place (XOR is its own inverse) */
-	df_sw_xor_page(page, current->df_ctx.seed_bytes, addr);
+	{
+		u32 dec_nonce = 0;
+		struct df_mem_mm_state *ns = df_mm_get_state(current->mm);
+		if (ns) {
+			unsigned long nf;
+			spin_lock_irqsave(&ns->lock, nf);
+			dec_nonce = df_mm_lookup_nonce(ns, addr);
+			spin_unlock_irqrestore(&ns->lock, nf);
+		}
+		df_sw_xor_page(page, current->df_ctx.seed_bytes, addr, dec_nonce);
+	}
 
 	/* Track it so context switch can re-encode */
 	df_mm_track_decoded(current->mm, page, addr);
@@ -1894,8 +2130,8 @@ static void __init df_mem_mm_states_init(void)
 	for (i = 0; i < DF_MM_HASH_SIZE; i++) {
 		spin_lock_init(&df_mm_states[i].lock);
 		df_mm_states[i].count = 0;
-	}
 		df_mm_states[i].owner = NULL;
+	}
 }
 /* ============================================================
  * SECTION 15: PTE-Marked Encoding — Always-Encrypted RAM
@@ -1934,20 +2170,23 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 	int ret;
 
 	if (!df_mem_initialized || !df_mem_enabled) {
-		pr_info("dialectforge: SIGBUS init=%d enabled=%d pid=%d addr=%lx\n",
+		pr_info_ratelimited("dialectforge: SIGBUS init=%d enabled=%d pid=%d addr=%lx\n",
 			df_mem_initialized, df_mem_enabled, current->pid, vmf->address);
+		pte_unmap(vmf->pte);
 		return VM_FAULT_SIGBUS;
 	}
 
 	if (!current->mm) {
-		pr_info("dialectforge: SIGBUS no-mm pid=%d addr=%lx\n",
+		pr_debug("dialectforge: SIGBUS no-mm pid=%d addr=%lx\n",
 			current->pid, vmf->address);
-		return VM_FAULT_SIGBUS;
+		pte_unmap(vmf->pte);
+		return 0;	/* let fault retry; process will be reaped */
 	}
 
 	if (!(current->df_ctx.flags & DF_TASKF_SEED_VALID)) {
-		pr_info("dialectforge: SIGBUS no-seed pid=%d addr=%lx flags=0x%x\n",
+		pr_info_ratelimited("dialectforge: SIGBUS no-seed pid=%d addr=%lx flags=0x%x\n",
 			current->pid, vmf->address, current->df_ctx.flags);
+		pte_unmap(vmf->pte);
 		return VM_FAULT_SIGBUS;
 	}
 
@@ -1956,15 +2195,15 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 	 */
 	spin_lock(vmf->ptl);
 	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
-		spin_unlock(vmf->ptl);
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		return 0; /* Retry â PTE changed under us */
 	}
 
 	folio = vm_normal_folio(vmf->vma, vmf->address, vmf->orig_pte);
 	if (!folio) {
-		pr_info("dialectforge: SIGBUS no-folio pid=%d addr=%lx pte=%lx\n",
+		pr_info_ratelimited("dialectforge: SIGBUS no-folio pid=%d addr=%lx pte=%lx\n",
 			current->pid, vmf->address, pte_val(vmf->orig_pte));
-		spin_unlock(vmf->ptl);
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		return VM_FAULT_SIGBUS;
 	}
 	page = folio_page(folio, 0);
@@ -1972,6 +2211,10 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 	/* Pin the page so it can't vanish while we decode outside ptl */
 	/* Pin the page so it can't vanish while we decode outside ptl */
 	get_page(page);
+
+	/* DF-004: nonce for page decode; set in !skip_xor path, reused if PTE race */
+	{
+	u32 dec_nonce = 0;
 
 	/* Check SOFTW3: protected-but-cleartext = skip expensive XOR.
 	 * This happens when task was scheduled out (PTEs protected fast)
@@ -1981,15 +2224,23 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 		spin_unlock(vmf->ptl);
 
 		if (!skip_xor) {
+			struct df_mem_mm_state *ns = df_mm_get_state(current->mm);
+			if (ns) {
+				unsigned long nf;
+				spin_lock_irqsave(&ns->lock, nf);
+				dec_nonce = df_mm_lookup_nonce(ns, vmf->address);
+				spin_unlock_irqrestore(&ns->lock, nf);
+			}
 			/* PHASE 2: Heavy crypto outside all spinlocks */
 			pr_debug("df-xor-call: DECODE-FAULT pfn=%lx vaddr=%lx pid=%d\n",
 				page_to_pfn(page), vmf->address, current->pid);
 			ret = df_sw_xor_page(page, current->df_ctx.seed_bytes,
-					     vmf->address);
+					     vmf->address, dec_nonce);
 			if (ret) {
-				pr_info("dialectforge: SIGBUS xor-fail pid=%d addr=%lx ret=%d\n",
+				pr_info_ratelimited("dialectforge: SIGBUS xor-fail pid=%d addr=%lx ret=%d\n",
 					current->pid, vmf->address, ret);
 				put_page(page);
+				pte_unmap(vmf->pte);
 				return VM_FAULT_SIGBUS;
 			}
 		} else {
@@ -2011,10 +2262,23 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 		/* PTE raced â re-encode (XOR is symmetric) to restore */
 		pr_debug("df-xor-call: RACE-REVERT pfn=%lx vaddr=%lx pid=%d\n",
 			page_to_pfn(page), vmf->address, current->pid);
-		df_sw_xor_page(page, current->df_ctx.seed_bytes, vmf->address);
+		/* Race: re-encode with same nonce, then re-store it for retry */
+		df_sw_xor_page(page, current->df_ctx.seed_bytes, vmf->address, dec_nonce);
+		if (dec_nonce) {
+			struct df_mem_mm_state *ns2 = df_mm_get_state(current->mm);
+			if (ns2) {
+				unsigned long nf2;
+				spin_lock_irqsave(&ns2->lock, nf2);
+				df_mm_store_nonce(ns2, vmf->address, dec_nonce);
+				spin_unlock_irqrestore(&ns2->lock, nf2);
+			}
+		}
 		put_page(page);
+		pte_unmap(vmf->pte);
 		return 0; /* Caller will retry the fault */
 	}
+
+	} /* end dec_nonce scope */
 
 	/* Flip PTE: PROTNONE+SOFTW2 â PRESENT.
 	 * Must use flip_protnone_guard to un-invert PFN bits â
@@ -2040,7 +2304,7 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 
 	/* DEBUG: one-shot diagnostic when a process FIRST enters encode cycle */
 	if (!(current->df_ctx.mem_flags & DF_MEMF_PAGES_ENCODED))
-		pr_info("dialectforge: FIRST-ENCODE pid=%d addr=%lx mm=%px hash=%lu flags=0x%x\n",
+		pr_debug("dialectforge: FIRST-ENCODE pid=%d addr=%lx mm=%px hash=%lu flags=0x%x\n",
 			current->pid, vmf->address, current->mm,
 			((unsigned long)current->mm >> 12) & 0xFF,
 			current->df_ctx.mem_flags);
@@ -2056,6 +2320,7 @@ int df_mem_pte_decode_fault(struct vm_fault *vmf)
 	df_mem_dbg("pte-decode: addr=%lx pid=%d pfn=%lx\n",
 		   vmf->address, current->pid, page_to_pfn(page));
 
+	pte_unmap(vmf->pte);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(df_mem_pte_decode_fault);
@@ -2137,8 +2402,17 @@ void df_mem_decode_vma_range(struct mm_struct *mm, unsigned long start,
 		get_page(page);
 		spin_unlock(ptl);
 		/* XOR-decode outside spinlock (may sleep for keystream) */
-		if (!skip_xor)
-			df_sw_xor_page(page, current->df_ctx.seed_bytes, addr);
+		if (!skip_xor) {
+			u32 dec_nonce = 0;
+			struct df_mem_mm_state *ns = df_mm_get_state(mm);
+			if (ns) {
+				unsigned long nf;
+				spin_lock_irqsave(&ns->lock, nf);
+				dec_nonce = df_mm_lookup_nonce(ns, addr);
+				spin_unlock_irqrestore(&ns->lock, nf);
+			}
+			df_sw_xor_page(page, current->df_ctx.seed_bytes, addr, dec_nonce);
+		}
 
 		/* Re-acquire lock and flip PTE to PRESENT */
 		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);

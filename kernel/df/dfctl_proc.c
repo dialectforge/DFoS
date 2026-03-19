@@ -72,6 +72,10 @@ static ssize_t dfctl_write(struct file *file, const char __user *buf,
     pid_t pid;
     int ret;
 
+    /* DFoS: Require CAP_SYS_ADMIN for proc control interface */
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+
     if (count >= sizeof(kbuf))
         return -EINVAL;
 
@@ -139,7 +143,7 @@ int df_dfctl_proc_init(void)
 {
     struct proc_dir_entry *entry;
 
-    entry = proc_create("dfctl", 0644, NULL, &dfctl_proc_ops);
+    entry = proc_create("dfctl", 0400, NULL, &dfctl_proc_ops);
     if (!entry)
         return -ENOMEM;
 

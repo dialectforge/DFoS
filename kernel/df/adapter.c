@@ -268,9 +268,9 @@ int df_net_init(void)
 	df_proposal_ready = false;
 
 	df_net_gen_proposal();
-	proc_create("df_net", 0444, NULL, &df_net_proc_ops);
+	proc_create("df_net", 0400, NULL, &df_net_proc_ops);
 
-	pr_info("df_net: adapter initialized (cycle=%ds ks=%d bytes)\n",
+	pr_debug("df_net: adapter initialized (cycle=%ds ks=%d bytes)\n",
 		DF_NET_CYCLE_SEC, DF_NET_KS_LEN);
 	return 0;
 }

@@ -30,6 +30,22 @@ struct df_system *df_get_system(void)
 	return &df_sys;
 }
 EXPORT_SYMBOL_GPL(df_get_system);
+/* Install mode: when df.install=1 is on kernel cmdline,
+ * skip anomaly scoring and integrity enforcement.
+ * This allows the installer to copy system files without
+ * triggering lockdown from sensitive-path write scoring. */
+bool df_install_mode __ro_after_init = false;
+EXPORT_SYMBOL_GPL(df_install_mode);
+
+static int __init df_install_setup(char *str)
+{
+	if (str && *str == '1') {
+		df_install_mode = true;
+		pr_info("DialectForge: INSTALL MODE active — security scoring disabled\n");
+	}
+	return 1;
+}
+__setup("df.install=", df_install_setup);
 
 /* ==================================================================
  *  Dialect Management (uses cipher engine now)
@@ -174,9 +190,9 @@ static struct proc_dir_entry *df_proc_entry;
 
 static int df_proc_init(void)
 {
-	df_proc_entry = proc_create("dialectforge", 0444, NULL, &df_proc_ops);
+	df_proc_entry = proc_create("dialectforge", 0400, NULL, &df_proc_ops);
 	if (!df_proc_entry) return -ENOMEM;
-	pr_info("dialectforge: /proc/dialectforge active\n");
+	pr_debug("dialectforge: /proc/dialectforge active\n");
 
 
 	return 0;
@@ -206,12 +222,12 @@ int __init df_init(void)
 {
 	int ret;
 
-	pr_info("dialectforge: ========================================\n");
+	pr_debug("dialectforge: ========================================\n");
 	pr_info("dialectforge:   DialectForge OS v%d.%d.%d\n",
 	        DF_VERSION_MAJOR, DF_VERSION_MINOR, DF_VERSION_PATCH);
 	pr_info("dialectforge:   Copyright (c) 2026 John Dean Martin\n");
 	pr_info("dialectforge:   Patent Pending\n");
-	pr_info("dialectforge: ========================================\n");
+	pr_debug("dialectforge: ========================================\n");
 
 	memset(&df_sys, 0, sizeof(df_sys));
 	spin_lock_init(&df_sys.lock);
@@ -277,12 +293,12 @@ int __init df_init(void)
 
 	df_sys.status = DF_STATUS_ACTIVE;
 
-	pr_info("dialectforge: ========================================\n");
-	pr_info("dialectforge:   ALL SUBSYSTEMS ACTIVE\n");
-	pr_info("dialectforge:   Cipher:  AES-256-GCM + XOR_FAST\n");
-	pr_info("dialectforge:   Seeds:   HKDF-SHA256\n");
-	pr_info("dialectforge:   Anomaly: scoring active\n");
-	pr_info("dialectforge:   Sysctl:  /proc/sys/dialectforge/\n");
+	pr_debug("dialectforge: ========================================\n");
+	pr_debug("dialectforge:   ALL SUBSYSTEMS ACTIVE\n");
+	pr_debug("dialectforge:   Cipher:  AES-256-GCM + XOR_FAST\n");
+	pr_debug("dialectforge:   Seeds:   HKDF-SHA256\n");
+	pr_debug("dialectforge:   Anomaly: scoring active\n");
+	pr_debug("dialectforge:   Sysctl:  /proc/sys/dialectforge/\n");
 	
         /* ── Phase 3: Quarantine & LSM ── */
 
@@ -298,6 +314,11 @@ int __init df_init(void)
         if (ret)
                 pr_warn("dialectforge: dfctl proc init failed: %d\n", ret);
 
+        /* Initialize USB auto-quarantine (detects boot device from cmdline) */
+        ret = df_usb_quarantine_init();
+        if (ret)
+                pr_warn("dialectforge: USB quarantine init failed: %d\n", ret);
+
         /* Set init process (PID 1) as native tier */
         {
                 struct task_struct *init_task_p = &init_task;
@@ -309,14 +330,18 @@ int __init df_init(void)
                 init_task_p->df_ctx.zone_id = 0;
                 init_task_p->df_ctx.seed_born_ns = ktime_get_ns();
                 init_task_p->df_ctx.flags = DF_TASKF_SEED_VALID;
-                pr_info("dialectforge: init_task seeded as native tier 0\n");
+                pr_debug("dialectforge: init_task seeded as native tier 0\n");
         }
 
 
 	/* Phase 4: Network adapter */
+        /* Phase 7: Initialize Integrity Shield */
+        ret = df_integrity_init();
+        if (ret)
+                pr_warn("dialectforge: integrity shield init failed: %d\n", ret);
 	df_net_init();
-        pr_info("dialectforge:   The atmosphere has changed.\n");
-	pr_info("dialectforge: ========================================\n");
+        pr_debug("dialectforge:   The atmosphere has changed.\n");
+	pr_debug("dialectforge: ========================================\n");
 
 	
 	/* Phase 6: register AF_DIALECTFORGE protocol family */

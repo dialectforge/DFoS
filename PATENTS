@@ -1,0 +1,86 @@
+DialectForge Protocol — Patent Notice
+
+================================================================================
+PATENT PENDING
+================================================================================
+
+The DialectForge protocol and all related methods, systems, and architectures
+are the subject of one or more pending patent applications filed by
+John Dean Martin.
+
+The patent claims cover, but are not limited to, the following inventions:
+
+1. THREE-TIER TRUST MODEL
+   A system for classifying running software into Native, Adopted, and
+   Quarantine tiers, where each tier receives different cryptographic
+   seeds and access permissions, and where untrusted software is
+   automatically isolated in ephemeral cryptographic sandboxes.
+
+2. HIERARCHICAL SEED DERIVATION ARCHITECTURE
+   A method of deriving per-process, per-page, and per-zone cryptographic
+   seeds from a single root seed using labeled HKDF, creating a tree
+   structure where revoking a parent seed cryptographically invalidates
+   all descendant seeds.
+
+3. DIALECT CYCLE ROTATION
+   A method of periodically rotating all cryptographic parameters in an
+   operating system at timed intervals with randomized jitter, causing
+   all derived encryption keys, sector maps, and keystreams to change
+   simultaneously.
+
+4. XOR AGGREGATE CONSENSUS NEGOTIATION
+   A method for multiple parties to establish a shared cryptographic
+   key by each contributing a seed proposal that is XOR-aggregated
+   into a consensus value, without any single party controlling the
+   outcome.
+
+5. QUARANTINE ZONE LIFECYCLE
+   A system of ephemeral cryptographic sandboxes with time-to-live
+   expiration, where zone destruction zeroes the seed and renders all
+   data encrypted under that seed permanently unrecoverable.
+
+6. USB AUTO-QUARANTINE TRUST BOUNDARY
+   A method of automatically detecting and isolating USB storage devices
+   by locking the boot device identity at kernel initialization and
+   placing all subsequent USB storage in quarantine zones with
+   automatic cryptographic wipe on device disconnect.
+
+7. PER-PROCESS MEMORY PAGE ENCRYPTION
+   A system for transparently encrypting each process's memory pages
+   with unique keys derived from that process's seed, with automatic
+   hardware backend detection and software fallback.
+
+8. ALL RELATED METHODS
+   All methods, systems, and apparatus relating to the DialectForge
+   protocol, including but not limited to: anomaly-triggered emergency
+   rotation, cross-dialect ptrace prevention, tier-aware IPC
+   enforcement, package quarantine pipelines, and encrypted filesystem
+   sector hopping.
+
+================================================================================
+LICENSING
+================================================================================
+
+Commercial implementation of the DialectForge protocol — whether using this
+codebase or independently re-implementing the protocol — requires a patent
+license from John Dean Martin, REGARDLESS of the license under which any
+source code is distributed.
+
+The GPL v2 license covering the kernel source code in the dfos-kernel
+repository grants copyright permissions to use, modify, and distribute the
+code. It does NOT grant a patent license for commercial implementation of
+the protocol.
+
+Personal, non-commercial, educational, and research use of the protocol
+is permitted without a patent license.
+
+For commercial patent licensing inquiries, contact:
+
+   John Dean Martin
+   Email: john@dialectforge.com
+   Web:   https://dialectforge.com
+
+================================================================================
+Copyright (C) 2026 John Dean Martin. All Rights Reserved.
+Patent Pending.
+================================================================================
