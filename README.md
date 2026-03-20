@@ -1,26 +1,44 @@
-# DialectForge OS — Kernel
+# DialectForge OS
 
 **The first penetration-proof operating system.**
 
-Linux 6.12.12 LTS kernel fork with the DialectForge protocol integrated at the foundational level. Security is not a layer on top — it is the material the system is made of.
+DialectForge OS is a Linux 6.12 LTS kernel fork where the DialectForge protocol is integrated at the foundational level. Security is not a layer on top — it is the material the system is made of.
 
 *Patent Pending — Provisional Application Filed February 25, 2026*
 
-## Architecture
+## The Problem
 
-Traditional OS security is a lock. DialectForge security is an atmosphere.
+Every operating system in existence treats security as a layer. Firewalls, encryption, access controls, SELinux, AppArmor — all bolted on top of a fundamentally static, deterministic system. Every penetration test in history exploits that determinism: predictable port numbers, static packet structures, known memory layouts, fixed key storage locations.
 
-Malware cannot function on DFOS — not because it was detected, but because the environment is structurally incompatible. Every process runs in a cryptographic dialect derived from a 256-bit seed hierarchy. Dialects cycle. The atmosphere changes. Even malware built specifically for DFOS would fail because the dialect it was built for no longer exists.
+The entire cybersecurity industry exists because operating systems are architecturally predictable.
 
-**Three-Tier Trust Model:**
-- **Native (Tier 0):** Born on DFOS with DF toolchain. Full dialect citizenship.
-- **Adopted (Tier 1):** External software promoted through dfpkg. Scoped seed context.
-- **Quarantine (Tier 2):** Downloads, email attachments, random binaries. Ephemeral dialect. Can compute, cannot interact with the real system.
+## The Solution
 
-**Why Root Doesn't Matter:**
-Root is a permission level that doesn't grant dialect knowledge. An attacker with root sees dialect-encoded noise in memory, IPC, and filesystem. Master key to a building where every room speaks a language that changes every hour.
+DialectForge OS eliminates the determinism itself.
 
-## Kernel Components (~8,900 lines)
+Every process runs in a cryptographic dialect derived from a 256-bit seed hierarchy. Dialects cycle. Memory is encrypted per-process. IPC channels speak ephemeral languages. The filesystem is noise on disk. Malware cannot function — not because it was detected, but because the environment is structurally incompatible. Like trying to run Windows malware on an iPhone.
+
+DFOS extends this further: even malware built specifically for DFOS would fail, because the dialect has cycled. The atmosphere changed.
+
+## What Root Gets You
+
+Nothing useful. Root is a permission level that doesn't grant dialect knowledge. An attacker with root sees dialect-encoded noise in memory, IPC, and filesystem. Master key to a building where every room speaks a language that changes every hour.
+
+## Three-Tier Trust Model
+
+- **Native (Tier 0):** Built on DFOS with DF toolchain. Full dialect citizenship.
+- **Adopted (Tier 1):** External software promoted through dfpkg. Scoped seed context — Firefox gets network access, not your documents.
+- **Quarantine (Tier 2):** Downloads, email attachments, random binaries. Ephemeral dialect. Can compute, cannot interact with the real system. Tourists with an expiring visa.
+
+## Downloads
+
+Pre-built bootable images: **[dfos-releases](https://github.com/dialectforge/dfos-releases/releases)**
+
+Flash to USB, boot, done. Credentials: `dfuser` / `dialectforge`
+
+## Kernel Subsystem (~8,900 lines)
+
+This repository contains the GPL v2 kernel source code.
 
 | Path | Description |
 |------|-------------|
@@ -34,55 +52,50 @@ Root is a permission level that doesn't grant dialect knowledge. An attacker wit
 | `df/usb_quarantine.c` | USB auto-quarantine, boot device lock |
 | `df/adapter.c` | Network adapter, XOR consensus handshake |
 | `df/negotiate.c` | Consensus negotiation for shared keys |
-| `df/dfctl_proc.c` | `/proc/dfctl` admin interface |
 | `df/df_tunnel.c` | Encrypted tunnel daemon |
-| `df/dfctl.c` | CLI admin tool |
-| `df/dfpkg.c` | Package manager (kernel helper) |
-| `df/compress.c` | Emergent compression |
-| `df/sysctl.c` | Sysctl tunables |
-| `security/df_lsm.c` | Linux Security Module hooks |
-| `security/df_quarantine.c` | Tier enforcement helpers |
+| `security/df_lsm.c` | Linux Security Module (10 hooks) |
 | `mm/df_mem.c` | Per-process memory page encryption |
 | `fs/dialectfs/` | Encrypted filesystem with sector hopping |
 | `net/df_proto/` | AF_DIALECTFORGE protocol family |
 | `crypto/df_kyber.c` | CRYSTALS-Kyber-768 post-quantum |
 
-## Building
-
-Requires Linux kernel build environment (gcc, make, flex, bison, libelf-dev, libssl-dev).
+## Building from Source
 
 ```bash
 git clone https://github.com/dialectforge/DFoS.git
 cd DFoS
 
-# The DF subsystem source lives in kernel/
-# To build, overlay onto a Linux 6.12.12 source tree:
-# cp -r kernel/df/ /path/to/linux-6.12.12/df/
-# cp -r kernel/security/ /path/to/linux-6.12.12/security/
-# cp -r kernel/mm/ /path/to/linux-6.12.12/mm/
-# cp -r kernel/fs/ /path/to/linux-6.12.12/fs/
-# cp -r kernel/net/ /path/to/linux-6.12.12/net/
-# cp -r kernel/crypto/ /path/to/linux-6.12.12/crypto/
-# cp kernel/include/linux/dialectforge.h /path/to/linux-6.12.12/include/linux/
+# Overlay DF source onto Linux 6.12.12 source tree:
+cp -r kernel/df/ /path/to/linux-6.12.12/df/
+cp -r kernel/security/df_* /path/to/linux-6.12.12/security/
+cp -r kernel/mm/df_mem.c /path/to/linux-6.12.12/mm/
+cp -r kernel/fs/dialectfs/ /path/to/linux-6.12.12/fs/
+cp -r kernel/net/df_proto/ /path/to/linux-6.12.12/net/
+cp -r kernel/crypto/df_kyber.c /path/to/linux-6.12.12/crypto/
+cp kernel/include/linux/dialectforge.h /path/to/linux-6.12.12/include/linux/
 
-# Then configure and build:
-# make menuconfig  # Enable CONFIG_DIALECTFORGE=y
-# make -j$(nproc)
+# Configure and build:
+make menuconfig  # Enable CONFIG_DIALECTFORGE=y
+make -j$(nproc)
 ```
 
-## Downloads
+## Userspace Tools
 
-Pre-built bootable images: [dfos-releases](https://github.com/dialectforge/dfos-releases)
-
-Userspace tools (dfctl, dfpkg, installer): [dfos-tools](https://github.com/dialectforge/dfos-tools)
+The userspace tools (dfctl, dfpkg, installer, pentest suite) are proprietary and available separately. Contact dialectforge@gmail.com for commercial licensing or access.
 
 ## License
 
-- **Kernel code:** GPL v2 (see [LICENSE](LICENSES/))
+- **Kernel code:** GPL v2
 - **DialectForge protocol:** Patent Pending (see [PATENTS](PATENTS))
 
 Free for personal, research, and educational use. Commercial deployment requires a protocol license.
 
+## Links
+
+- **Website:** [dialectforge.com](https://dialectforge.com)
+- **Releases:** [github.com/dialectforge/dfos-releases](https://github.com/dialectforge/dfos-releases)
+- **Prior Art:** [DialectForge-Native Language Models](https://github.com/dialectforge/dialectforge-prompt)
+
 ## Author
 
-John Dean Martin — [dialectforge.com](https://dialectforge.com)
+John Dean Martin — Ewen, Michigan
